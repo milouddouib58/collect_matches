@@ -12,7 +12,7 @@ import joblib
 
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder # Import LabelEncoder
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import log_loss
 from sklearn.compose import ColumnTransformer
@@ -87,6 +87,12 @@ def run_training(features_file: str, league: str, model_out: str, cv_splits=3, s
     X_train, y_train = train_df.reindex(columns=feat_cols), train_df["target"]
     X_test, y_test = test_df.reindex(columns=feat_cols), test_df["target"]
 
+    # Encode the target variable
+    encoder = LabelEncoder()
+    y_train_encoded = encoder.fit_transform(y_train)
+    y_test_encoded = encoder.transform(y_test)
+
+
     preproc = make_preprocessor(feat_cols)
     models_and_grids = build_models_and_grids(preproc)
 
@@ -104,9 +110,12 @@ def run_training(features_file: str, league: str, model_out: str, cv_splits=3, s
             n_jobs=-1,
             verbose=1
         )
-        gs.fit(X_train, y_train)
+        gs.fit(X_train, y_train_encoded) # Use encoded target for training
         best_estimators[name] = gs.best_estimator_
-        all_results[name] = {"best_score": gs.best_score_, "best_params": gs.best_params_}
+        all_results[name] = {
+            "best_score": float(gs.best_score_), # Convert to float
+            "best_params": gs.best_params_
+            }
         print(f"✅ Best {name}: score={gs.best_score_:.5f}")
 
     print("\n🧠 Building Ensemble Model...")
@@ -115,14 +124,17 @@ def run_training(features_file: str, league: str, model_out: str, cv_splits=3, s
     print("Combining models:", [name for name, _ in ensemble_estimators])
 
     voting_clf = VotingClassifier(estimators=ensemble_estimators, voting='soft')
-    voting_clf.fit(X_train, y_train)
+    voting_clf.fit(X_train, y_train_encoded) # Use encoded target for training
 
     test_proba = voting_clf.predict_proba(X_test)
-    test_loss = log_loss(y_test, test_proba, labels=voting_clf.classes_)
+    test_loss = log_loss(y_test_encoded, test_proba, labels=voting_clf.classes_) # Use encoded target for loss calculation
     print(f"\n🏆 Ensemble Model Test LogLoss: {test_loss:.5f}")
 
     # تخزين نسخة الميزات داخل الكائن
     setattr(voting_clf, "feature_version_", FEATURE_VERSION)
+    # Store the encoder as well
+    setattr(voting_clf, "label_encoder_", encoder)
+
 
     joblib.dump(voting_clf, model_out)
     print(f"\n✅ Final Ensemble model saved to: {model_out}")
@@ -132,7 +144,7 @@ def run_training(features_file: str, league: str, model_out: str, cv_splits=3, s
         "best_individual_models": all_results,
         "ensemble_components": [name for name, _ in top_models],
         "ensemble_test_logloss": float(test_loss),
-        "classes_": list(voting_clf.classes_),
+        "classes_": [int(c) for c in voting_clf.classes_], # Convert to standard int
         "feature_version": FEATURE_VERSION,
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
     }
