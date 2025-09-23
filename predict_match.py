@@ -1,37 +1,30 @@
 # predict_match.py
 # -*- coding: utf-8 -*-
 import argparse
+from datetime import datetime, timezone
 import pandas as pd
 import joblib
-from datetime import datetime, timezone
 
 from features_lib import compute_single_pair_features, FEATURE_VERSION
-
 
 def maybe_refresh_data(league: str, data_csv: str):
     try:
         from collect_matches import collect_league
         print(f"- Quick refresh of the last 12 months for league {league}...")
-        collect_league(league_code=league, out_csv=data_csv, current_only=True)
+        collect_league(league_code=league, out_csv=data_csv, start_season=2020, end_season=2020, current_only=True)
         print("- Data refreshed.")
     except Exception as e:
         print(f"! Automatic refresh failed: {e}")
         print("> Continuing without refresh…")
 
-
-# --- تم تبسيط وتصحيح هذه الدالة ---
-def load_model(model_path):
-    """
-    Loads any scikit-learn compatible model object directly from a joblib file.
-    """
+def load_model(model_path: str):
     try:
         model = joblib.load(model_path)
-        print(f"✅ Model loaded successfully from {model_path}")
+        print(f"✅ Model loaded from {model_path}")
         return model
     except Exception as e:
-        print(f"❌ Failed to load model from {model_path}")
-        raise e
-
+        print(f"❌ Failed to load model from {model_path}: {e}")
+        raise
 
 def main():
     parser = argparse.ArgumentParser(description="Predict a match outcome (probabilities H/D/A).")
@@ -40,7 +33,7 @@ def main():
     parser.add_argument("--away", type=str, required=True, help="Away team name")
     parser.add_argument("--model", type=str, required=True, help="Path to the joblib model file")
     parser.add_argument("--data", type=str, default="matches_data.csv", help="CSV file with match data")
-    parser.add_argument("--refresh", action="store_true", help="Refresh data for the last 12 months before prediction")
+    parser.add_argument("--refresh", action="store_true", help="Refresh last ~12 months data before prediction")
     args = parser.parse_args()
 
     if args.refresh:
@@ -49,7 +42,6 @@ def main():
     matches = pd.read_csv(args.data)
     pipeline = load_model(args.model)
 
-    # التحقق من إصدار الميزات (إذا كان متوفراً في النموذج)
     model_feature_version = getattr(pipeline, "feature_version_", "Unknown")
     if model_feature_version != "Unknown" and model_feature_version != FEATURE_VERSION:
         print(f"! Warning: Feature version in model ({model_feature_version}) differs from current lib ({FEATURE_VERSION}).")
@@ -61,15 +53,12 @@ def main():
         away_team_input=args.away,
         ref_datetime=datetime.now(timezone.utc)
     )
-    
-    # لا حاجة لإعادة ترتيب الأعمدة لأن النموذج المدمج لا يعتمد عليها مباشرة
-    # لكنها ممارسة جيدة إذا كان النموذج الداخلي يتطلب ذلك
+
     if hasattr(pipeline, "feature_names_in_"):
         X = X.reindex(columns=pipeline.feature_names_in_, fill_value=0)
 
     proba = pipeline.predict_proba(X)[0]
     classes_model = list(pipeline.classes_)
-
     prob_map = {cls: float(p) for cls, p in zip(classes_model, proba)}
     p_home = prob_map.get("H", 0.0)
     p_draw = prob_map.get("D", 0.0)
@@ -86,7 +75,6 @@ def main():
     top = max([("Home win", p_home), ("Draw", p_draw), ("Away win", p_away)], key=lambda x: x[1])
     print(f"Prediction: {top[0]} ({top[1]:.1%})")
     print("========================================")
-
 
 if __name__ == "__main__":
     main()
