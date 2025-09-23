@@ -169,6 +169,7 @@ def add_performance_vs_ranks_features(team_matches: pd.DataFrame, season_ranks: 
     tm.fillna({'ppg_vs_top5': 0, 'ppg_vs_bot5': 0}, inplace=True)
     return tm
 
+# ===================== هندسة الميزات للمباريات التاريخية =====================
 def compute_h2h_for_home(row: pd.Series, matches: pd.DataFrame, k: int = 3) -> Tuple[float, float, float]:
     comp, home, away, dt = row.competition, row.home_team, row.away_team, row.date
     prev = matches[(matches.competition == comp) & (matches.date < dt) & (
