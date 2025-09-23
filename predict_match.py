@@ -4,76 +4,69 @@ import argparse
 from datetime import datetime, timezone
 import pandas as pd
 import joblib
+import importlib
 
 from features_lib import compute_single_pair_features, FEATURE_VERSION
 
-def maybe_refresh_data(league: str, data_csv: str):
+try:
+    from skops.io import load as skops_load
+    SKOPS_AVAILABLE = True
+except Exception:
+    SKOPS_AVAILABLE = False
+
+def ensure_sklearn_unpickle_shims():
     try:
-        from collect_matches import collect_league
-        print(f"- Quick refresh of the last 12 months for league {league}...")
-        collect_league(league_code=league, out_csv=data_csv, start_season=2020, end_season=2020, current_only=True)
-        print("- Data refreshed.")
-    except Exception as e:
-        print(f"! Automatic refresh failed: {e}")
-        print("> Continuing without refresh…")
+        ct_mod = importlib.import_module("sklearn.compose._column_transformer")
+        if not hasattr(ct_mod, "_RemainderColsList"):
+            class _RemainderColsList(list): pass
+            ct_mod._RemainderColsList = _RemainderColsList
+    except Exception:
+        pass
 
-def load_model(model_path: str):
-    try:
-        model = joblib.load(model_path)
-        print(f"✅ Model loaded from {model_path}")
-        return model
-    except Exception as e:
-        print(f"❌ Failed to load model from {model_path}: {e}")
-        raise
+def load_model_any(path: str):
+    if SKOPS_AVAILABLE and path.endswith(".skops"):
+        return skops_load(path, trusted=True)
+    ensure_sklearn_unpickle_shims()
+    return joblib.load(path)
 
-def main():
-    parser = argparse.ArgumentParser(description="Predict a match outcome (probabilities H/D/A).")
-    parser.add_argument("--league", type=str, default="PL", help="League code (PL, PD, SA, BL1, FL1...)")
-    parser.add_argument("--home", type=str, required=True, help="Home team name")
-    parser.add_argument("--away", type=str, required=True, help="Away team name")
-    parser.add_argument("--model", type=str, required=True, help="Path to the joblib model file")
-    parser.add_argument("--data", type=str, default="matches_data.csv", help="CSV file with match data")
-    parser.add_argument("--refresh", action="store_true", help="Refresh last ~12 months data before prediction")
-    args = parser.parse_args()
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Predict match outcome H/D/A probabilities.")
+    parser.add_argument("--league", type=str, default="PL")
+    parser.add_argument("--home", type=str, required=True)
+    parser.add_argument("--away", type=str, required=True)
+    parser.add_argument("--model", type=str, required=True)  # .skops مفضل
+    parser.add_argument("--data", type=str, default="matches_data.csv")
+    parser.add_argument("--when", type=str, default=None)  # ISO datetime UTC
+    args, _ = parser.parse_known_args(argv)
 
-    if args.refresh:
-        maybe_refresh_data(args.league, args.data)
-
+    ref_dt = datetime.now(timezone.utc) if not args.when else datetime.fromisoformat(args.when).astimezone(timezone.utc)
     matches = pd.read_csv(args.data)
-    pipeline = load_model(args.model)
+    pipeline = load_model_any(args.model)
 
     model_feature_version = getattr(pipeline, "feature_version_", "Unknown")
     if model_feature_version != "Unknown" and model_feature_version != FEATURE_VERSION:
-        print(f"! Warning: Feature version in model ({model_feature_version}) differs from current lib ({FEATURE_VERSION}).")
+        print(f"! Warning: Feature version differs: model={model_feature_version}, code={FEATURE_VERSION}")
 
     X, meta = compute_single_pair_features(
-        matches=matches,
-        competition=args.league,
-        home_team_input=args.home,
-        away_team_input=args.away,
-        ref_datetime=datetime.now(timezone.utc)
+        matches=matches, competition=args.league,
+        home_team_input=args.home, away_team_input=args.away,
+        ref_datetime=ref_dt
     )
 
-    if hasattr(pipeline, "feature_names_in_"):
+    # ترتيب أعمدة الميزات
+    expected_cols = getattr(pipeline, "feature_names_expected_", None)
+    if expected_cols is not None:
+        X = X.reindex(columns=list(expected_cols), fill_value=0)
+    elif hasattr(pipeline, "feature_names_in_"):
         X = X.reindex(columns=pipeline.feature_names_in_, fill_value=0)
 
     proba = pipeline.predict_proba(X)[0]
     classes_model = list(pipeline.classes_)
     prob_map = {cls: float(p) for cls, p in zip(classes_model, proba)}
-    p_home = prob_map.get("H", 0.0)
-    p_draw = prob_map.get("D", 0.0)
-    p_away = prob_map.get("A", 0.0)
-
     print("========================================")
-    print(f"League: {args.league}")
-    print(f"Match: {meta['home_team_resolved']} vs {meta['away_team_resolved']}")
+    print(f"{meta['home_team_resolved']} vs {meta['away_team_resolved']} | League: {args.league}")
     print("----------------------------------------")
-    print(f"Home win probability (H): {p_home:.1%}")
-    print(f"Draw probability (D):     {p_draw:.1%}")
-    print(f"Away win probability (A): {p_away:.1%}")
-    print("----------------------------------------")
-    top = max([("Home win", p_home), ("Draw", p_draw), ("Away win", p_away)], key=lambda x: x[1])
-    print(f"Prediction: {top[0]} ({top[1]:.1%})")
+    print(f"H: {prob_map.get('H',0.0):.1%} | D: {prob_map.get('D',0.0):.1%} | A: {prob_map.get('A',0.0):.1%}")
     print("========================================")
 
 if __name__ == "__main__":
