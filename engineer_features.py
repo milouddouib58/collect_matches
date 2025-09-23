@@ -4,12 +4,12 @@ import argparse
 import pandas as pd
 from features_lib import engineer_match_features, list_feature_columns, FEATURE_VERSION
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="هندسة ميزات من ملف المباريات إلى ملف ميزات للتدريب.")
-    parser.add_argument("--input", type=str, default="matches_data.csv", help="مسار ملف المباريات CSV")
-    parser.add_argument("--league", type=str, default="PL", help="رمز الدوري (PL, PD, SA, BL1, FL1 ...)")
-    parser.add_argument("--output", type=str, default=None, help="مسار إخراج الميزات CSV")
-    args = parser.parse_args()
+    parser.add_argument("--input", type=str, default="matches_data.csv")
+    parser.add_argument("--league", type=str, default="PL")
+    parser.add_argument("--output", type=str, default=None)
+    args, _ = parser.parse_known_args(argv)
 
     out_path = args.output or f"features_{args.league}.csv"
     matches = pd.read_csv(args.input)
