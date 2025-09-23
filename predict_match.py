@@ -53,7 +53,6 @@ def main(argv=None):
         ref_datetime=ref_dt
     )
 
-    # ترتيب أعمدة الميزات
     expected_cols = getattr(pipeline, "feature_names_expected_", None)
     if expected_cols is not None:
         X = X.reindex(columns=list(expected_cols), fill_value=0)
@@ -63,6 +62,7 @@ def main(argv=None):
     proba = pipeline.predict_proba(X)[0]
     classes_model = list(pipeline.classes_)
     prob_map = {cls: float(p) for cls, p in zip(classes_model, proba)}
+
     print("========================================")
     print(f"{meta['home_team_resolved']} vs {meta['away_team_resolved']} | League: {args.league}")
     print("----------------------------------------")
