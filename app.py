@@ -37,7 +37,8 @@ def load_model(model_path: str):
     try:
         if SKOPS_AVAILABLE and model_path.lower().endswith(".skops"):
             return skops_load(model_path, trusted=True)
-        ensure_sklearn_unpickle_shims()  # fallback للـ joblib
+        # fallback للـ joblib
+        ensure_sklearn_unpickle_shims()
         return joblib.load(model_path)
     except Exception as e:
         msg = str(e)
@@ -110,9 +111,44 @@ def render_diag():
             st.cache_resource.clear()
             st.success("Resource cache cleared.")
 
+def map_proba_to_HDA(classes_model, proba):
+    """
+    يحوّل أي تمثيل للفئات إلى خريطة H/D/A -> probability.
+    يدعم:
+      - نصوص H/D/A مباشرة (أو مرادفات: Home/Draw/Away, 1/X/2)
+      - أرقام {0,1,2} كما ينتج LabelEncoder أبجديًا (A=0, D=1, H=2)
+    """
+    labels = list(classes_model)
+
+    # حالة نصوص
+    if all(isinstance(c, str) for c in labels):
+        norm = {}
+        for cls, p in zip(labels, proba):
+            s = cls.strip().lower()
+            if s in ("h", "home", "home win", "1"): norm["H"] = float(p)
+            elif s in ("d", "draw", "x"): norm["D"] = float(p)
+            elif s in ("a", "away", "away win", "2"): norm["A"] = float(p)
+        # إذا كانت بالضبط H/D/A ولكن بحروف مختلفة
+        if not norm and set([c.upper() for c in labels]) >= {"H","D","A"}:
+            for cls, p in zip(labels, proba):
+                norm[cls.upper()] = float(p)
+        return {"H": norm.get("H",0.0), "D": norm.get("D",0.0), "A": norm.get("A",0.0)}
+
+    # حالة أرقام {0,1,2} => A=0, D=1, H=2
+    try:
+        if set(int(x) for x in labels) == {0,1,2}:
+            idxA = labels.index(0)
+            idxD = labels.index(1)
+            idxH = labels.index(2)
+            return {"H": float(proba[idxH]), "D": float(proba[idxD]), "A": float(proba[idxA])}
+    except Exception:
+        pass
+
+    # fallback
+    return {"H": 0.0, "D": 0.0, "A": 0.0}
+
 # ============== واجهة المستخدم ==============
 st.title("⚽ Football Match Predictor")
-
 render_diag()
 
 COMPETITIONS = {
@@ -133,15 +169,13 @@ default_model_name = f"ensemble_model_v3_PL.skops" if SKOPS_AVAILABLE else f"ens
 model_file = st.text_input("Model file path", default_model_name)
 data_file = st.text_input("Historical data CSV", "matches_data.csv")
 
-# ————— وضع Live API —————
 league = None
 home_team = None
 away_team = None
 ref_time = None
 
 if mode == "Live API":
-    # تحميل API KEY من secrets أو environment
-    api_key = None
+    # تحميل API KEY من secrets أو environment (لا نوقف الصفحة إن لم يوجد)
     if "FOOTBALL_DATA_API_KEY" in st.secrets and st.secrets["FOOTBALL_DATA_API_KEY"]:
         os.environ["FOOTBALL_DATA_API_KEY"] = st.secrets["FOOTBALL_DATA_API_KEY"]
     api_key = os.getenv("FOOTBALL_DATA_API_KEY", "")
@@ -150,7 +184,7 @@ if mode == "Live API":
     with c1:
         league = st.selectbox("League", list(COMPETITIONS.keys()), format_func=lambda x: COMPETITIONS[x], index=0)
     with c2:
-        st.caption("Tip: switch to Manual entry if you don't have an API key.")
+        st.caption("Tip: Switch to Manual entry if you don't have an API key.")
 
     matches_df = pd.DataFrame([])
     if api_key:
@@ -168,7 +202,7 @@ if mode == "Live API":
     else:
         st.info("No scheduled matches fetched. You can switch to Manual entry mode below.")
 else:
-    # ————— وضع Manual entry —————
+    # Manual entry
     league = st.selectbox("League", list(COMPETITIONS.keys()), format_func=lambda x: COMPETITIONS[x], index=0, key="league_manual")
     c1, c2 = st.columns(2)
     with c1:
@@ -182,7 +216,6 @@ run = st.button("🔮 Predict")
 
 # ============== تنفيذ التنبؤ ==============
 if run:
-    import os
     # تحقق من الملفات
     if not os.path.exists(model_file):
         st.error(f"❌ Model file not found: {model_file}")
@@ -226,19 +259,19 @@ if run:
             st.error(f"Feature computation failed: {e}")
             st.stop()
 
-    # إعادة ترتيب الأعمدة كما يتوقع النموذج
+    # إعادة ترتيب الأعمدة كما يتوقعها النموذج
     expected_cols = getattr(pipeline, "feature_names_expected_", None)
     if expected_cols is not None:
         X = X.reindex(columns=list(expected_cols), fill_value=0)
     elif hasattr(pipeline, "feature_names_in_"):
         X = X.reindex(columns=pipeline.feature_names_in_, fill_value=0)
 
-    # تنبؤ
+    # تنبؤ واحتمالات
     with st.spinner("Predicting..."):
         try:
             proba = pipeline.predict_proba(X)[0]
-            classes_model = list(pipeline.classes_)  # نصوص: H/D/A
-            prob_map = {cls: float(p) for cls, p in zip(classes_model, proba)}
+            classes_model = list(getattr(pipeline, "classes_", []))
+            prob_map = map_proba_to_HDA(classes_model, proba)
         except Exception as e:
             st.error(f"Prediction failed: {e}")
             st.stop()
@@ -264,5 +297,5 @@ if run:
             "away_team_input": away_team,
             "away_team_resolved": meta.get("away_team_resolved"),
             "feature_version_in_model": model_feature_version,
-            "classes_": classes_model,
+            "classes_": list(getattr(pipeline, "classes_", [])),
         })
