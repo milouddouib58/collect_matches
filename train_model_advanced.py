@@ -19,7 +19,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.neural_network import MLPClassifier
 
-# نماذج إضافية إذا متوفرة
+# Optional models
 try:
     from xgboost import XGBClassifier
     XGB_AVAILABLE = True
@@ -113,14 +113,14 @@ def run_training(features_file: str, league: str, model_out: str, cv_splits=3, s
     test_loss = log_loss(y_test, test_proba, labels=voting_clf.classes_)
     print(f"\n🏆 Ensemble Model Test LogLoss: {test_loss:.5f}")
 
-    # خصائص مفيدة للتطبيق
+    # خصائص للموديل
     import sklearn, sys
     setattr(voting_clf, "feature_version_", FEATURE_VERSION)
     setattr(voting_clf, "sklearn_version_", sklearn.__version__)
     setattr(voting_clf, "python_version_", sys.version)
     setattr(voting_clf, "feature_names_expected_", feat_cols)
 
-    # حفظ
+    # حفظ .joblib و .skops
     joblib.dump(voting_clf, model_out)
     print(f"✅ Saved joblib: {model_out}")
     if SKOPS_AVAILABLE:
@@ -153,7 +153,7 @@ def get_arg_parser():
     parser = argparse.ArgumentParser(description="Train ensemble model for match outcome prediction.")
     parser.add_argument("--features-file", type=str, default=None, help="Path to engineered features CSV (default: features_{league}.csv)")
     parser.add_argument("--league", type=str, default="PL", help="League code")
-    parser.add_argument("--model-out", type=str, default="ensemble_model_v3_PL.joblib", help="Output path (.joblib); .skops will be created too if available")
+    parser.add_argument("--model-out", type=str, default="ensemble_model_v3_PL.joblib", help="Output path (.joblib); .skops will also be saved if available")
     parser.add_argument("--cv-splits", type=int, default=3)
     return parser
 
@@ -162,7 +162,6 @@ def main(argv=None):
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         print(f"Ignoring unknown args (likely from Jupyter): {unknown}")
-
     features_file = args.features_file or f"features_{args.league}.csv"
     if not Path(features_file).exists():
         raise FileNotFoundError(f"Features file not found: {features_file}. Generate it with engineer_features.py first.")
