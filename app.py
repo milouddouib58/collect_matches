@@ -1,6 +1,7 @@
 # app.py
 # -*- coding: utf-8 -*-
 import os
+import sys
 import streamlit as st
 import pandas as pd
 import requests
@@ -10,49 +11,16 @@ from importlib import import_module
 
 from features_lib import compute_single_pair_features, FEATURE_VERSION
 
-# skops للتحميل الآمن عبر الإصدارات
+# حاول استخدام skops أولاً (للتحميل الآمن عبر الإصدارات)
 try:
     from skops.io import load as skops_load
     SKOPS_AVAILABLE = True
 except Exception:
     SKOPS_AVAILABLE = False
 
-st.set_page_config(page_title="Football Match Predictor", page_icon="⚽")
+st.set_page_config(page_title="Football Match Predictor", page_icon="⚽", layout="centered")
 
-# تحميل API key
-if "FOOTBALL_DATA_API_KEY" in st.secrets and st.secrets["FOOTBALL_DATA_API_KEY"]:
-    os.environ["FOOTBALL_DATA_API_KEY"] = st.secrets["FOOTBALL_DATA_API_KEY"]
-API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
-if not API_KEY:
-    st.error("❌ API key not found! Please set FOOTBALL_DATA_API_KEY in secrets or environment.")
-    st.stop()
-
-COMPETITIONS = {
-    "PL": "Premier League",
-    "PD": "La Liga",
-    "SA": "Serie A",
-    "BL1": "Bundesliga",
-    "FL1": "Ligue 1",
-}
-
-@st.cache_data(ttl=300)
-def fetch_upcoming_matches(league_code: str) -> pd.DataFrame:
-    url = f"https://api.football-data.org/v4/competitions/{league_code}/matches"
-    headers = {"X-Auth-Token": API_KEY}
-    params = {"status": "SCHEDULED"}
-    resp = requests.get(url, headers=headers, params=params, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    rows = []
-    for m in data.get("matches", []):
-        rows.append({
-            "utcDate": m.get("utcDate"),
-            "homeTeam": (m.get("homeTeam") or {}).get("name"),
-            "awayTeam": (m.get("awayTeam") or {}).get("name"),
-            "matchday": m.get("matchday"),
-        })
-    return pd.DataFrame(rows)
-
+# ============== أدوات مساعدة ==============
 def ensure_sklearn_unpickle_shims():
     # Hotfix: نماذج joblib القديمة قد تحتاج _RemainderColsList
     try:
@@ -67,9 +35,9 @@ def ensure_sklearn_unpickle_shims():
 @st.cache_resource
 def load_model(model_path: str):
     try:
-        if SKOPS_AVAILABLE and model_path.endswith(".skops"):
+        if SKOPS_AVAILABLE and model_path.lower().endswith(".skops"):
             return skops_load(model_path, trusted=True)
-        ensure_sklearn_unpickle_shims()  # fallback joblib
+        ensure_sklearn_unpickle_shims()  # fallback للـ joblib
         return joblib.load(model_path)
     except Exception as e:
         msg = str(e)
@@ -77,24 +45,33 @@ def load_model(model_path: str):
             st.error(
                 "Failed to load model due to scikit-learn version mismatch. "
                 "Use a .skops model, or pin scikit-learn to the training version, "
-                "or retrain with the provided script (no ColumnTransformer)."
+                "or retrain with the provided training script (no ColumnTransformer)."
             )
         else:
             st.error(f"Failed to load model: {e}")
         raise
 
-st.title("⚽ Football Match Predictor")
-
-colA, colB = st.columns([1, 2])
-with colA:
-    league = st.selectbox("Select League", list(COMPETITIONS.keys()), format_func=lambda x: COMPETITIONS[x])
-with colB:
-    st.info(f"Feature version expected by code: {FEATURE_VERSION}")
-
-matches_df = fetch_upcoming_matches(league)
-if matches_df.empty:
-    st.warning("⚠️ No upcoming matches found for this league.")
-    st.stop()
+@st.cache_data(ttl=300)
+def fetch_upcoming_matches(league_code: str, api_key: str) -> pd.DataFrame:
+    try:
+        url = f"https://api.football-data.org/v4/competitions/{league_code}/matches"
+        headers = {"X-Auth-Token": api_key}
+        params = {"status": "SCHEDULED"}
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        rows = []
+        for m in data.get("matches", []):
+            rows.append({
+                "utcDate": m.get("utcDate"),
+                "homeTeam": (m.get("homeTeam") or {}).get("name"),
+                "awayTeam": (m.get("awayTeam") or {}).get("name"),
+                "matchday": m.get("matchday"),
+            })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        st.warning(f"Failed to fetch matches: {e}")
+        return pd.DataFrame([])
 
 def fmt_match(row):
     try:
@@ -104,44 +81,152 @@ def fmt_match(row):
         dt_str = row.utcDate
     return f"{row.homeTeam} vs {row.awayTeam} — {dt_str}"
 
-match_strs = [fmt_match(r) for r in matches_df.itertuples()]
-match_choice = st.selectbox("Choose Match", match_strs)
-chosen = matches_df.iloc[match_strs.index(match_choice)]
-home_team, away_team = chosen["homeTeam"], chosen["awayTeam"]
-ref_time = datetime.fromisoformat(chosen["utcDate"].replace("Z", "+00:00")).astimezone(timezone.utc)
+def render_diag():
+    with st.sidebar.expander("Diagnostics", expanded=False):
+        import platform
+        ver = {}
+        try:
+            import sklearn; ver["scikit-learn"] = sklearn.__version__
+        except Exception:
+            ver["scikit-learn"] = "N/A"
+        try:
+            import numpy as np; ver["numpy"] = np.__version__
+        except Exception:
+            ver["numpy"] = "N/A"
+        try:
+            import pandas as pd; ver["pandas"] = pd.__version__
+        except Exception:
+            ver["pandas"] = "N/A"
+        ver["joblib"] = getattr(joblib, "__version__", "N/A")
+        ver["skops"] = "available" if SKOPS_AVAILABLE else "not installed"
+        ver["python"] = sys.version.split()[0]
+        ver["platform"] = platform.platform()
+        st.json(ver)
+        colA, colB = st.columns(2)
+        if colA.button("Clear data cache"):
+            st.cache_data.clear()
+            st.success("Data cache cleared.")
+        if colB.button("Clear resource cache"):
+            st.cache_resource.clear()
+            st.success("Resource cache cleared.")
+
+# ============== واجهة المستخدم ==============
+st.title("⚽ Football Match Predictor")
+
+render_diag()
+
+COMPETITIONS = {
+    "PL": "Premier League",
+    "PD": "La Liga",
+    "SA": "Serie A",
+    "BL1": "Bundesliga",
+    "FL1": "Ligue 1",
+}
+
+st.info(f"Feature version expected by code: {FEATURE_VERSION}")
+
+# اختيار وضع الإدخال
+mode = st.radio("Input mode", ["Live API", "Manual entry"], index=0, horizontal=True)
+
+# إدخال مسارات النموذج والبيانات
+default_model_name = f"ensemble_model_v3_PL.skops" if SKOPS_AVAILABLE else f"ensemble_model_v3_PL.joblib"
+model_file = st.text_input("Model file path", default_model_name)
+data_file = st.text_input("Historical data CSV", "matches_data.csv")
+
+# ————— وضع Live API —————
+league = None
+home_team = None
+away_team = None
+ref_time = None
+
+if mode == "Live API":
+    # تحميل API KEY من secrets أو environment
+    api_key = None
+    if "FOOTBALL_DATA_API_KEY" in st.secrets and st.secrets["FOOTBALL_DATA_API_KEY"]:
+        os.environ["FOOTBALL_DATA_API_KEY"] = st.secrets["FOOTBALL_DATA_API_KEY"]
+    api_key = os.getenv("FOOTBALL_DATA_API_KEY", "")
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        league = st.selectbox("League", list(COMPETITIONS.keys()), format_func=lambda x: COMPETITIONS[x], index=0)
+    with c2:
+        st.caption("Tip: switch to Manual entry if you don't have an API key.")
+
+    matches_df = pd.DataFrame([])
+    if api_key:
+        with st.spinner("Fetching scheduled matches..."):
+            matches_df = fetch_upcoming_matches(league, api_key)
+    else:
+        st.warning("No API key found. Set FOOTBALL_DATA_API_KEY in secrets or environment, or use Manual entry mode.")
+
+    if not matches_df.empty:
+        match_strs = [fmt_match(r) for r in matches_df.itertuples()]
+        match_choice = st.selectbox("Choose Match", match_strs)
+        chosen = matches_df.iloc[match_strs.index(match_choice)]
+        home_team, away_team = chosen["homeTeam"], chosen["awayTeam"]
+        ref_time = datetime.fromisoformat(chosen["utcDate"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    else:
+        st.info("No scheduled matches fetched. You can switch to Manual entry mode below.")
+else:
+    # ————— وضع Manual entry —————
+    league = st.selectbox("League", list(COMPETITIONS.keys()), format_func=lambda x: COMPETITIONS[x], index=0, key="league_manual")
+    c1, c2 = st.columns(2)
+    with c1:
+        home_team = st.text_input("Home team", value="Arsenal")
+    with c2:
+        away_team = st.text_input("Away team", value="Chelsea")
+    ref_time = st.datetime_input("Reference datetime (UTC)", value=datetime.now(timezone.utc))
 
 st.divider()
-st.subheader("Model and Data")
+run = st.button("🔮 Predict")
 
-default_model = f"ensemble_model_v3_{league}.skops" if SKOPS_AVAILABLE else f"ensemble_model_v3_{league}.joblib"
-model_file = st.text_input("Model file path", default_model)
-data_file = st.text_input("Historical data file path", "matches_data.csv")
-
-if st.button("🔮 Predict"):
+# ============== تنفيذ التنبؤ ==============
+if run:
     import os
+    # تحقق من الملفات
     if not os.path.exists(model_file):
-        st.error(f"❌ Model file not found: {model_file}"); st.stop()
+        st.error(f"❌ Model file not found: {model_file}")
+        st.stop()
     if not os.path.exists(data_file):
-        st.error(f"❌ Data file not found: {data_file}"); st.stop()
+        st.error(f"❌ Data file not found: {data_file}")
+        st.stop()
+    if not (home_team and away_team and league and ref_time):
+        st.error("Please ensure League, Home team, Away team, and Reference time are set.")
+        st.stop()
 
-    matches_hist = pd.read_csv(data_file)
-    pipeline = load_model(model_file)
+    # تحميل البيانات والنموذج
+    with st.spinner("Loading data and model..."):
+        try:
+            matches_hist = pd.read_csv(data_file)
+        except Exception as e:
+            st.error(f"Failed to read CSV: {e}")
+            st.stop()
+
+        try:
+            pipeline = load_model(model_file)
+        except Exception:
+            st.stop()
 
     # تحذير توافق نسخة الميزات
     model_feature_version = getattr(pipeline, "feature_version_", "Unknown")
     if model_feature_version != "Unknown" and model_feature_version != FEATURE_VERSION:
         st.warning(f"Model feature version ({model_feature_version}) differs from code ({FEATURE_VERSION}). Consider retraining.")
 
-    # إعداد ميزات المباراة
-    X, meta = compute_single_pair_features(
-        matches=matches_hist,
-        competition=league,
-        home_team_input=home_team,
-        away_team_input=away_team,
-        ref_datetime=ref_time
-    )
+    # استخراج الميزات
+    with st.spinner("Computing features..."):
+        try:
+            X, meta = compute_single_pair_features(
+                matches=matches_hist,
+                competition=league,
+                home_team_input=home_team,
+                away_team_input=away_team,
+                ref_datetime=ref_time
+            )
+        except Exception as e:
+            st.error(f"Feature computation failed: {e}")
+            st.stop()
 
-    # رتب الأعمدة كما توقعها النموذج
+    # إعادة ترتيب الأعمدة كما يتوقع النموذج
     expected_cols = getattr(pipeline, "feature_names_expected_", None)
     if expected_cols is not None:
         X = X.reindex(columns=list(expected_cols), fill_value=0)
@@ -149,9 +234,15 @@ if st.button("🔮 Predict"):
         X = X.reindex(columns=pipeline.feature_names_in_, fill_value=0)
 
     # تنبؤ
-    proba = pipeline.predict_proba(X)[0]
-    classes_model = list(pipeline.classes_)  # H/D/A كنصوص
-    prob_map = {cls: float(p) for cls, p in zip(classes_model, proba)}
+    with st.spinner("Predicting..."):
+        try:
+            proba = pipeline.predict_proba(X)[0]
+            classes_model = list(pipeline.classes_)  # نصوص: H/D/A
+            prob_map = {cls: float(p) for cls, p in zip(classes_model, proba)}
+        except Exception as e:
+            st.error(f"Prediction failed: {e}")
+            st.stop()
+
     p_home, p_draw, p_away = prob_map.get("H", 0.0), prob_map.get("D", 0.0), prob_map.get("A", 0.0)
 
     st.subheader(f"🔮 Prediction for {home_team} vs {away_team}")
@@ -160,7 +251,10 @@ if st.button("🔮 Predict"):
     c2.metric("🤝 Draw", f"{p_draw:.1%}")
     c3.metric("🛫 Away Win", f"{p_away:.1%}")
 
-    outcome, conf = max([("Home Win", p_home), ("Draw", p_draw), ("Away Win", p_away)], key=lambda x: x[1])
+    outcome, conf = max(
+        [("Home Win", p_home), ("Draw", p_draw), ("Away Win", p_away)],
+        key=lambda x: x[1]
+    )
     st.success(f"Most likely outcome: {outcome} ({conf:.1%})")
 
     with st.expander("Details"):
