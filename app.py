@@ -1,191 +1,99 @@
 # app.py
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
-import numpy as np
 import joblib
-from datetime import date
+from features_lib import _resolve_team_name, compute_h2h_for_home, list_feature_columns, parse_dates
+from predict_match import map_proba_to_HDA
 
-st.set_page_config(page_title="Football Predictor", layout="centered")
+# --- إعدادات الصفحة ---
+st.set_page_config(
+    page_title="متنبئ المباريات ⚽",
+    page_icon="🔮",
+    layout="centered"
+)
 
-# ---------- Utils ----------
-def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [c.strip().lower().replace(' ', '_').replace('-', '_') for c in df.columns]
-    alias = {
-        'date': ['date','match_date'],
-        'competition': ['competition','league','tournament'],
-        'home_team_name': ['home_team_name','home_team','home'],
-        'away_team_name': ['away_team_name','away_team','away'],
-        'home_team_id': ['home_team_id','home_id','home_code'],
-        'away_team_id': ['away_team_id','away_id','away_code'],
-        'home_team_elo': ['home_team_elo','home_elo'],
-        'away_team_elo': ['away_team_elo','away_elo'],
-        'elo_diff': ['elo_diff'],
-        'home_form_points': ['home_form_points','home_last5_points','home_form_pts'],
-        'away_form_points': ['away_form_points','away_last5_points','away_form_pts'],
-        'home_form_gs': ['home_form_gs','home_last5_goals_scored'],
-        'home_form_gc': ['home_form_gc','home_last5_goals_conceded'],
-        'away_form_gs': ['away_form_gs','away_last5_goals_scored'],
-        'away_form_gc': ['away_form_gc','away_last5_goals_conceded'],
-        'home_team_league_pos': ['home_team_league_pos','home_pos','home_rank'],
-        'away_team_league_pos': ['away_team_league_pos','away_pos','away_rank'],
-    }
-    for target, cands in alias.items():
-        if target not in df.columns:
-            for c in cands:
-                if c in df.columns:
-                    df[target] = df[c]
-                    break
-    if 'home_team_id' not in df.columns and 'home_team_name' in df.columns:
-        df['home_team_id'] = df['home_team_name'].astype(str)
-    if 'away_team_id' not in df.columns and 'away_team_name' in df.columns:
-        df['away_team_id'] = df['away_team_name'].astype(str)
-    if 'elo_diff' not in df.columns:
-        if 'home_team_elo' in df.columns and 'away_team_elo' in df.columns:
-            df['elo_diff'] = pd.to_numeric(df['home_team_elo'], errors='coerce') - pd.to_numeric(df['away_team_elo'], errors='coerce')
-    if 'competition' not in df.columns:
-        df['competition'] = 'Unknown'
-    if 'date' not in df.columns:
-        df['date'] = pd.to_datetime(date.today()).strftime("%Y-%m-%d")
-    return df
-
-def combine_probs(p_draw: np.ndarray, p_home_given_no_draw: np.ndarray) -> np.ndarray:
-    p_home = (1.0 - p_draw) * p_home_given_no_draw
-    p_away = (1.0 - p_draw) * (1.0 - p_home_given_no_draw)
-    P = np.vstack([p_home, p_draw, p_away]).T
-    P = np.clip(P, 1e-12, 1.0)
-    return P / P.sum(axis=1, keepdims=True)
-
-def compute_closeness_score(X: pd.DataFrame) -> np.ndarray:
-    # يعتمد على مخرجات FeatureBuilder
-    return 0.5*X['closeness_elo'].values + 0.25*X['closeness_points'].values + 0.25*X['closeness_gd'].values
-
-class BinTS:
-    def __init__(self, T): self.T = T
-    def transform(self, p):
-        p = np.clip(p, 1e-12, 1-1e-12)
-        z = np.log(p/(1-p))
-        return 1.0 / (1.0 + np.exp(-z / self.T))
-
+# --- تحميل الموارد باستخدام الكاش لتسريع الأداء ---
+# يتم تحميل هذه الموارد مرة واحدة فقط عند بدء تشغيل التطبيق
 @st.cache_resource
-def load_artifact(path_or_file):
-    if hasattr(path_or_file, "read"):  # Uploaded file
-        return joblib.load(path_or_file)
-    return joblib.load(path_or_file)
+def load_model(path="ensemble_model_v3_PL.joblib"):
+    return joblib.load(path)
 
-def predict_from_df(art, df_raw: pd.DataFrame) -> pd.DataFrame:
-    # 1) normalize + fill optional columns
-    df = normalize_schema(df_raw)
-    for opt in ['home_team_league_pos','away_team_league_pos','competition','date','home_team_id','away_team_id']:
-        if opt not in df.columns: df[opt] = np.nan
+@st.cache_data
+def load_data(path="matches_data.csv"):
+    return parse_dates(pd.read_csv(path))
 
-    # 2) features
-    fb = art['feature_builder']
-    tp = art['team_priors']
-    X = pd.concat([fb.transform(df), tp.transform(df)], axis=1)
+@st.cache_data
+def load_features(path="features_PL.csv"):
+    # نأخذ أحدث سطر لكل فريق من ملف الميزات
+    df = pd.read_csv(path)
+    df_latest = df.sort_values('date').drop_duplicates(subset='home_team', keep='last')
+    return df_latest.set_index('home_team')
 
-    # 3) stage models + calibration
-    m1, T1 = art['stage1_draw_model'], art['stage1_temp_T']
-    m2, T2 = art['stage2_ha_model'], art['stage2_temp_T']
-    tau, gamma = art['decision']['tau_draw'], art['decision']['gamma_close']
-    label_map = art['label_map']
+# --- تحميل كل شيء ---
+MODEL = load_model()
+MATCHES_HISTORY = load_data()
+FEATURES_DF = load_features()
+LEAGUE_CODE = "PL"
 
-    p_draw = BinTS(T1).transform(m1.predict_proba(X)[:,1])
-    p_home_cond = BinTS(T2).transform(m2.predict_proba(X)[:,1])
-    P = combine_probs(p_draw, p_home_cond)
+# --- الواجهة الرسومية ---
+st.title("🔮 التنبؤ بنتائج المباريات")
+st.write("تطبيق للتنبؤ بنتائج مباريات الدوري الإنجليزي الممتاز (PL) باستخدام نموذج تعلم الآلة.")
 
-    s = compute_closeness_score(X)
-    draw_mask = (p_draw >= tau) & (s >= gamma)
-    y_pred = np.where(draw_mask, 1, np.where(p_home_cond >= 0.5, 0, 2))
+st.markdown("---")
 
-    out = pd.DataFrame({
-        'pred': [label_map[i] for i in y_pred],
-        'prob_home': P[:,0],
-        'prob_draw': P[:,1],
-        'prob_away': P[:,2],
-        'p_draw_stage1': p_draw,
-        'p_home_given_no_draw': p_home_cond,
-        'closeness': s
-    })
-    # احتفظ ببعض أعمدة الإدخال المفيدة
-    keep_cols = [c for c in ['date','competition','home_team_name','away_team_name','home_team_id','away_team_id',
-                             'home_team_elo','away_team_elo','home_form_points','away_form_points'] if c in df.columns]
-    return pd.concat([df[keep_cols].reset_index(drop=True), out], axis=1)
+# --- مدخلات المستخدم ---
+home_team_input = st.text_input("الفريق المضيف (Home Team)", placeholder="e.g., Man City")
+away_team_input = st.text_input("الفريق الضيف (Away Team)", placeholder="e.g., Arsenal")
 
-# ---------- UI ----------
-st.title("⚽ Football Outcome Predictor (Inference)")
+if st.button("🎯 تنبؤ بالنتيجة"):
+    if home_team_input and away_team_input:
+        with st.spinner("...جاري التحليل"):
+            try:
+                # --- منطق التنبؤ ---
+                team_pool = list(FEATURES_DF.index)
+                home_team = _resolve_team_name(home_team_input, team_pool)
+                away_team = _resolve_team_name(away_team_input, team_pool)
 
-# تحميل النموذج
-st.markdown("حمّل ملف النموذج المدرب (.joblib) أو استخدم مسار على الخادم.")
-colA, colB = st.columns([2,1])
-with colA:
-    model_file = st.file_uploader("Upload artifact (.joblib)", type=["joblib"])
-with colB:
-    default_path = st.text_input("Path on server", "football_model_two_stage.joblib")
+                # استخراج الميزات المحسوبة مسبقًا
+                home_features = FEATURES_DF.loc[home_team]
+                away_features = FEATURES_DF.loc[away_team]
 
-if st.button("Load Model"):
-    try:
-        art = load_artifact(model_file if model_file else default_path)
-        st.success("Model loaded ✅")
-        st.session_state["art"] = art
-        # عرض معلومات النسخ للمساعدة على ضبط requirements
-        meta = art.get('meta', {})
-        st.info(f"xgboost={meta.get('xgboost_version','?')} | best_iter_stage1={meta.get('best_iter_stage1')} | best_iter_stage2={meta.get('best_iter_stage2')}")
-    except Exception as e:
-        st.error(f"Failed to load model: {e}")
+                feature_vector = {}
+                # بناء متجه الميزات
+                for col in home_features.index:
+                    if col.startswith('h_'):
+                        feature_vector[col] = home_features[col]
+                    if col.startswith('a_'):
+                        corresponding_h_col = 'h_' + col[2:]
+                        feature_vector[col] = away_features.get(corresponding_h_col)
+                
+                # حساب المواجهات المباشرة (H2H)
+                h2h_series = pd.Series({"competition": LEAGUE_CODE, "home_team": home_team, "away_team": away_team, "date": pd.Timestamp.now(tz='utc')})
+                pts, gf, ga = compute_h2h_for_home(h2h_series, MATCHES_HISTORY, k=3)
+                feature_vector["h2h_home_pts3"], feature_vector["h2h_home_avg_gf3"], feature_vector["h2h_home_avg_ga3"] = pts, gf, ga
 
-if "art" in st.session_state:
-    st.header("Single Match Prediction")
-    with st.form("single"):
-        c1, c2 = st.columns(2)
-        with c1:
-            date_str = st.text_input("Date (YYYY-MM-DD)", value=str(date.today()))
-            competition = st.text_input("Competition", value="League")
-            home_name = st.text_input("Home Team (name/id)", value="Home")
-            home_elo = st.number_input("Home ELO", 1200, 2300, 1600)
-            home_form_pts = st.number_input("Home form points (last 5)", 0, 15, 8)
-            home_gs = st.number_input("Home goals scored (last 5)", 0, 20, 7)
-            home_gc = st.number_input("Home goals conceded (last 5)", 0, 20, 4)
-            home_pos = st.number_input("Home league pos (optional)", 1, 30, 10)
-        with c2:
-            away_name = st.text_input("Away Team (name/id)", value="Away")
-            away_elo = st.number_input("Away ELO", 1200, 2300, 1580)
-            away_form_pts = st.number_input("Away form points (last 5)", 0, 15, 7)
-            away_gs = st.number_input("Away goals scored (last 5)", 0, 20, 6)
-            away_gc = st.number_input("Away goals conceded (last 5)", 0, 20, 5)
-            away_pos = st.number_input("Away league pos (optional)", 1, 30, 12)
-        submitted = st.form_submit_button("Predict")
-    if submitted:
-        art = st.session_state["art"]
-        row = {
-            "date": date_str,
-            "competition": competition,
-            "home_team_id": home_name, "away_team_id": away_name,
-            "home_team_name": home_name, "away_team_name": away_name,
-            "home_team_elo": home_elo, "away_team_elo": away_elo,
-            "home_form_points": home_form_pts, "home_form_gs": home_gs, "home_form_gc": home_gc,
-            "away_form_points": away_form_pts, "away_form_gs": away_gs, "away_form_gc": away_gc,
-            "home_team_league_pos": home_pos, "away_team_league_pos": away_pos
-        }
-        df_pred = predict_from_df(art, pd.DataFrame([row]))
-        st.subheader(f"Prediction: {df_pred.loc[0,'pred']}")
-        st.write({
-            "Home Win": f"{df_pred.loc[0,'prob_home']:.2%}",
-            "Draw": f"{df_pred.loc[0,'prob_draw']:.2%}",
-            "Away Win": f"{df_pred.loc[0,'prob_away']:.2%}"
-        })
-        with st.expander("Details"):
-            st.dataframe(df_pred)
+                # تجهيز البيانات للنموذج
+                X = pd.DataFrame([feature_vector])
+                expected_cols = getattr(MODEL, "feature_names_expected_", list_feature_columns())
+                X = X.reindex(columns=expected_cols, fill_value=0)
 
-    st.header("Batch Prediction (CSV)")
-    st.markdown("ارفع CSV يحتوي على الأعمدة القياسية أو المرادفات (سيتم التطبيع تلقائيًا).")
-    csv_file = st.file_uploader("Upload matches CSV", type=["csv"], key="csvu")
-    if csv_file is not None:
-        try:
-            df_in = pd.read_csv(csv_file)
-            df_out = predict_from_df(st.session_state["art"], df_in)
-            st.success(f"Predicted {len(df_out)} matches ✅")
-            st.dataframe(df_out.head(20))
-            st.download_button("Download predictions CSV", df_out.to_csv(index=False), "predictions.csv", "text/csv")
-        except Exception as e:
-            st.error(f"Failed to predict: {e}")
+                # التنبؤ
+                proba = MODEL.predict_proba(X)[0]
+                encoder = getattr(MODEL, "label_encoder_", None)
+                classes_model = encoder.classes_ if encoder else list(getattr(MODEL, "classes_", ['A', 'D', 'H']))
+                prob_map = map_proba_to_HDA(classes_model, proba)
+
+                # عرض النتائج
+                st.subheader(f"📊 نتيجة التنبؤ لمباراة: {home_team} vs {away_team}")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("فوز المضيف (H)", f"{prob_map['H']:.1%}")
+                col2.metric("تعادل (D)", f"{prob_map['D']:.1%}")
+                col3.metric("فوز الضيف (A)", f"{prob_map['A']:.1%}")
+
+            except KeyError as e:
+                st.error(f"لم يتم العثور على الفريق: {e}. الرجاء التأكد من كتابة الاسم بشكل صحيح.")
+            except Exception as e:
+                st.error(f"حدث خطأ غير متوقع: {e}")
+    else:
+        st.warning("الرجاء إدخال اسم الفريقين.")
