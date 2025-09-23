@@ -12,10 +12,9 @@ import joblib
 
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler, LabelEncoder # Import LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import log_loss
-from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.neural_network import MLPClassifier
@@ -24,14 +23,20 @@ from sklearn.neural_network import MLPClassifier
 try:
     from xgboost import XGBClassifier
     XGB_AVAILABLE = True
-except ImportError:
+except Exception:
     XGB_AVAILABLE = False
-
 try:
     from lightgbm import LGBMClassifier
     LGBM_AVAILABLE = True
-except ImportError:
+except Exception:
     LGBM_AVAILABLE = False
+
+# skops للحفظ الآمن
+try:
+    from skops.io import dump as skops_dump
+    SKOPS_AVAILABLE = True
+except Exception:
+    SKOPS_AVAILABLE = False
 
 from features_lib import list_feature_columns, FEATURE_VERSION
 
@@ -44,13 +49,8 @@ def temporal_train_test_split(df: pd.DataFrame, test_size: float = 0.2):
     split_index = int(round(len(df_sorted) * (1 - test_size)))
     return df_sorted.iloc[:split_index], df_sorted.iloc[split_index:]
 
-def make_preprocessor(feature_cols):
-    return ColumnTransformer(transformers=[
-        ("num", Pipeline(steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler())
-        ]), feature_cols)
-    ])
+def make_preprocessor():
+    return Pipeline(steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
 
 def build_models_and_grids(preproc):
     models = {}
@@ -82,18 +82,11 @@ def run_training(features_file: str, league: str, model_out: str, cv_splits=3, s
     df = pd.read_csv(features_file).dropna(subset=["target"])
     feat_cols = list_feature_columns()
 
-    # استخدم reindex لضمان وجود كل الأعمدة (المفقودة تُملأ NaN ويعالجها الـ Imputer)
     train_df, test_df = temporal_train_test_split(df)
     X_train, y_train = train_df.reindex(columns=feat_cols), train_df["target"]
     X_test, y_test = test_df.reindex(columns=feat_cols), test_df["target"]
 
-    # Encode the target variable
-    encoder = LabelEncoder()
-    y_train_encoded = encoder.fit_transform(y_train)
-    y_test_encoded = encoder.transform(y_test)
-
-
-    preproc = make_preprocessor(feat_cols)
+    preproc = make_preprocessor()
     models_and_grids = build_models_and_grids(preproc)
 
     best_estimators = {}
@@ -102,20 +95,10 @@ def run_training(features_file: str, league: str, model_out: str, cv_splits=3, s
     print(f"🚀 Starting GridSearch for {len(models_and_grids)} models...")
     for name, (pipe, grid) in models_and_grids.items():
         print(f"\n🔍 Searching for best {name}...")
-        gs = GridSearchCV(
-            estimator=pipe,
-            param_grid=grid,
-            scoring=scoring,
-            cv=TimeSeriesSplit(n_splits=cv_splits),
-            n_jobs=-1,
-            verbose=1
-        )
-        gs.fit(X_train, y_train_encoded) # Use encoded target for training
+        gs = GridSearchCV(estimator=pipe, param_grid=grid, scoring=scoring, cv=TimeSeriesSplit(n_splits=cv_splits), n_jobs=-1, verbose=1)
+        gs.fit(X_train, y_train)
         best_estimators[name] = gs.best_estimator_
-        all_results[name] = {
-            "best_score": float(gs.best_score_), # Convert to float
-            "best_params": gs.best_params_
-            }
+        all_results[name] = {"best_score": gs.best_score_, "best_params": gs.best_params_}
         print(f"✅ Best {name}: score={gs.best_score_:.5f}")
 
     print("\n🧠 Building Ensemble Model...")
@@ -124,29 +107,44 @@ def run_training(features_file: str, league: str, model_out: str, cv_splits=3, s
     print("Combining models:", [name for name, _ in ensemble_estimators])
 
     voting_clf = VotingClassifier(estimators=ensemble_estimators, voting='soft')
-    voting_clf.fit(X_train, y_train_encoded) # Use encoded target for training
+    voting_clf.fit(X_train, y_train)
 
     test_proba = voting_clf.predict_proba(X_test)
-    test_loss = log_loss(y_test_encoded, test_proba, labels=voting_clf.classes_) # Use encoded target for loss calculation
+    test_loss = log_loss(y_test, test_proba, labels=voting_clf.classes_)
     print(f"\n🏆 Ensemble Model Test LogLoss: {test_loss:.5f}")
 
-    # تخزين نسخة الميزات داخل الكائن
+    # خصائص مفيدة للتطبيق
+    import sklearn, sys
     setattr(voting_clf, "feature_version_", FEATURE_VERSION)
-    # Store the encoder as well
-    setattr(voting_clf, "label_encoder_", encoder)
+    setattr(voting_clf, "sklearn_version_", sklearn.__version__)
+    setattr(voting_clf, "python_version_", sys.version)
+    setattr(voting_clf, "feature_names_expected_", feat_cols)
 
-
+    # حفظ
     joblib.dump(voting_clf, model_out)
-    print(f"\n✅ Final Ensemble model saved to: {model_out}")
+    print(f"✅ Saved joblib: {model_out}")
+    if SKOPS_AVAILABLE:
+        skops_path = model_out.replace(".joblib", ".skops")
+        skops_dump(voting_clf, skops_path, metadata={
+            "feature_version": FEATURE_VERSION,
+            "sklearn_version": sklearn.__version__,
+            "python_version": sys.version,
+            "league": league,
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+        })
+        print(f"✅ Saved skops: {skops_path}")
 
     metadata = {
         "league": league,
         "best_individual_models": all_results,
         "ensemble_components": [name for name, _ in top_models],
         "ensemble_test_logloss": float(test_loss),
-        "classes_": [int(c) for c in voting_clf.classes_], # Convert to standard int
+        "classes_": list(voting_clf.classes_),
         "feature_version": FEATURE_VERSION,
+        "sklearn_version": sklearn.__version__,
+        "python_version": sys.version,
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
+        "features_count": len(feat_cols),
     }
     with open(model_out.replace(".joblib", "_metadata.json"), 'w', encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -154,14 +152,13 @@ def run_training(features_file: str, league: str, model_out: str, cv_splits=3, s
 def get_arg_parser():
     parser = argparse.ArgumentParser(description="Train ensemble model for match outcome prediction.")
     parser.add_argument("--features-file", type=str, default=None, help="Path to engineered features CSV (default: features_{league}.csv)")
-    parser.add_argument("--league", type=str, default="PL", help="League code (PL, PD, SA, BL1, FL1...)")
-    parser.add_argument("--model-out", type=str, default="ensemble_model_v3_PL.joblib", help="Output path for the model")
+    parser.add_argument("--league", type=str, default="PL", help="League code")
+    parser.add_argument("--model-out", type=str, default="ensemble_model_v3_PL.joblib", help="Output path (.joblib); .skops will be created too if available")
     parser.add_argument("--cv-splits", type=int, default=3)
     return parser
 
 def main(argv=None):
     parser = get_arg_parser()
-    # استخدام parse_known_args لتجاهل -f من كولاب/جوبتر
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         print(f"Ignoring unknown args (likely from Jupyter): {unknown}")
@@ -169,14 +166,7 @@ def main(argv=None):
     features_file = args.features_file or f"features_{args.league}.csv"
     if not Path(features_file).exists():
         raise FileNotFoundError(f"Features file not found: {features_file}. Generate it with engineer_features.py first.")
-
-    run_training(
-        features_file=features_file,
-        league=args.league,
-        model_out=args.model_out,
-        cv_splits=args.cv_splits,
-        scoring="neg_log_loss"
-    )
+    run_training(features_file=features_file, league=args.league, model_out=args.model_out, cv_splits=args.cv_splits, scoring="neg_log_loss")
 
 if __name__ == "__main__":
     main()
