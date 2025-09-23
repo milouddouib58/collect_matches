@@ -1,16 +1,5 @@
-# train_grid_search.py
+# train_model_advanced.py
 # -*- coding: utf-8 -*-
-"""
-شغّل:
-# في Colab قد تحتاج لتثبيت الحزم التالية أولًا:
-# !pip install xgboost lightgbm
-
-python train_grid_search.py --features features_PL.csv --league PL --model-out best_grid_model.joblib
-أو في Colab:
-from train_grid_search import run_main
-run_main("features_PL.csv", "PL", "best_grid_model.joblib")
-"""
-
 import argparse
 import sys
 import os
@@ -37,7 +26,6 @@ from sklearn.compose import ColumnTransformer
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-# from sklearn.neural_network import MLPClassifier # Temporarily removed due to import error
 
 # حاول استيراد XGBoost و LightGBM إن أمكن
 try:
@@ -55,10 +43,8 @@ except Exception:
 # Import your features list from project
 from features_lib import list_feature_columns, FEATURE_VERSION
 
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-tf.random.set_seed(SEED)
+# تم حذف جزء TensorFlow لتبسيط الحل والتركيز على نماذج sklearn
+# import tensorflow as tf ...
 
 
 def temporal_train_test_split(df: pd.DataFrame, test_size: float = 0.2):
@@ -71,14 +57,7 @@ def temporal_train_test_split(df: pd.DataFrame, test_size: float = 0.2):
 
 
 def evaluate_on_test(pipeline, X_test, y_test_raw, encoder):
-    # pipeline may be (preprocessor, keras_model) tuple for fallback; here we only evaluate sklearn pipelines
-    if isinstance(pipeline, tuple):
-        preproc, keras_model = pipeline
-        X_test_proc = preproc.transform(X_test)
-        proba = keras_model.predict(X_test_proc)
-    else:
-        proba = pipeline.predict_proba(X_test)
-
+    proba = pipeline.predict_proba(X_test)
     preds_idx = np.argmax(proba, axis=1)
     preds = encoder.inverse_transform(preds_idx)
     acc = accuracy_score(y_test_raw, preds)
@@ -89,19 +68,16 @@ def evaluate_on_test(pipeline, X_test, y_test_raw, encoder):
 
 
 def make_preprocessor():
-    # Simple numeric-only preprocessor (expand if you have categorical features)
     numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler())
     ])
-    # apply to all feature columns
     return ColumnTransformer(transformers=[("num", numeric_transformer, list_feature_columns())])
 
 
 def build_models_and_grids():
     """Return dict of {name: (estimator_pipeline, param_grid)}"""
     preproc = make_preprocessor()
-
     models = {}
 
     # LogisticRegression
@@ -111,7 +87,7 @@ def build_models_and_grids():
     ])
     grid_log = {
         "clf__C": [0.01, 0.1, 1.0, 10.0],
-        "clf__penalty": ["l2"],  # 'l1' requires solver change; keep l2 for stability
+        "clf__penalty": ["l2"],
         "clf__solver": ["lbfgs"]
     }
     models["logreg"] = (pipe_log, grid_log)
@@ -122,26 +98,13 @@ def build_models_and_grids():
         ("clf", RandomForestClassifier(random_state=SEED, n_jobs=-1))
     ])
     grid_rf = {
-        "clf__n_estimators": [100, 300, 500],
+        "clf__n_estimators": [100, 300],
         "clf__max_depth": [None, 10, 20],
-        "clf__min_samples_leaf": [1, 2, 5],
-        "clf__class_weight": [None, "balanced", "balanced_subsample"]
+        "clf__min_samples_leaf": [1, 5],
+        "clf__class_weight": [None, "balanced"]
     }
     models["rf"] = (pipe_rf, grid_rf)
 
-    # MLP (sklearn) - Temporarily removed due to import error
-    # pipe_mlp = Pipeline([
-    #     ("preproc", preproc),
-    #     ("clf", MLPClassifier(max_iter=500, random_state=SEED))
-    # ])
-    # grid_mlp = {
-    #     "clf__hidden_layer_sizes": [(64, 32), (128, 64), (64,)],
-    #     "clf__alpha": [1e-4, 1e-3, 1e-2],
-    #     "clf__learning_rate_init": [1e-3, 5e-4]
-    # }
-    # models["mlp"] = (pipe_mlp, grid_mlp)
-
-    # XGBoost (if available)
     if XGB_AVAILABLE:
         pipe_xgb = Pipeline([
             ("preproc", preproc),
@@ -149,15 +112,14 @@ def build_models_and_grids():
         ])
         grid_xgb = {
             "clf__n_estimators": [100, 300],
-            "clf__max_depth": [3, 6, 10],
-            "clf__learning_rate": [0.01, 0.1, 0.2],
+            "clf__max_depth": [3, 6],
+            "clf__learning_rate": [0.01, 0.1],
             "clf__subsample": [0.7, 1.0]
         }
         models["xgboost"] = (pipe_xgb, grid_xgb)
     else:
         print("⚠️ xgboost not installed — skipping XGBoost model (install via pip install xgboost)")
 
-    # LightGBM (if available)
     if LGBM_AVAILABLE:
         pipe_lgb = Pipeline([
             ("preproc", preproc),
@@ -165,7 +127,7 @@ def build_models_and_grids():
         ])
         grid_lgb = {
             "clf__n_estimators": [100, 300],
-            "clf__max_depth": [-1, 8, 16],
+            "clf__max_depth": [-1, 16],
             "clf__learning_rate": [0.01, 0.1],
             "clf__num_leaves": [31, 63]
         }
@@ -176,10 +138,7 @@ def build_models_and_grids():
     return models
 
 
-def run_grid_search_for_model(name, pipeline, param_grid, X_train, y_train, cv, scoring="neg_log_loss", n_jobs=-1, verbose=2):
-    """
-    Run GridSearchCV and return fitted GridSearchCV object.
-    """
+def run_grid_search_for_model(name, pipeline, param_grid, X_train, y_train, cv, scoring="neg_log_loss", n_jobs=-1, verbose=1):
     gs = GridSearchCV(
         estimator=pipeline,
         param_grid=param_grid,
@@ -189,35 +148,32 @@ def run_grid_search_for_model(name, pipeline, param_grid, X_train, y_train, cv, 
         n_jobs=n_jobs,
         verbose=verbose
     )
-    print(f"\n>>> Running GridSearchCV for {name} with {len(param_grid.keys())} hyperparameter groups ...")
+    print(f"\n>>> Running GridSearchCV for {name} ...")
     gs.fit(X_train, y_train)
     print(f">>> Done {name}: best_score={gs.best_score_:.4f}, best_params={gs.best_params_}")
     return gs
 
 
 def run_training(features_file, league, model_out, cv_splits=3, scoring="neg_log_loss"):
-    # read
     df = pd.read_csv(features_file).dropna(subset=["target"])
     feat_cols = list_feature_columns()
     if not set(feat_cols).issubset(set(df.columns)):
         raise ValueError(f"Some feature columns missing in {features_file}. Expected: {feat_cols}")
 
-    # encode labels
     encoder = LabelEncoder()
     df["target_encoded"] = encoder.fit_transform(df["target"])
 
-    # temporal split
     train_df, test_df = temporal_train_test_split(df, test_size=0.2)
-    X_train, y_train = train_df[feat_cols], train_df["target"]
+    
+    # ✅ *** FIX 1: Use the encoded target for training ***
+    X_train, y_train = train_df[feat_cols], train_df["target_encoded"]
     X_test, y_test = test_df[feat_cols], test_df["target"]
 
-    # cross-validation strategy: TimeSeriesSplit
     tscv = TimeSeriesSplit(n_splits=cv_splits)
-
     models = build_models_and_grids()
 
     all_results = {}
-    best_overall_score = -np.inf  # because scoring is neg_log_loss, higher (closer to 0) is better
+    best_overall_score = -np.inf
     best_artifact = None
     best_model_name = None
 
@@ -230,7 +186,6 @@ def run_training(features_file, league, model_out, cv_splits=3, scoring="neg_log
             print(f"!!! GridSearch failed for {name}: {e}")
             continue
 
-        # evaluate best estimator on test
         test_metrics = evaluate_on_test(gs.best_estimator_, X_test, y_test, encoder)
         all_results[name] = {
             "best_params": gs.best_params_,
@@ -240,46 +195,53 @@ def run_training(features_file, league, model_out, cv_splits=3, scoring="neg_log
         }
         print(f"Test metrics for {name}: acc={test_metrics['accuracy']:.4f}, logloss={test_metrics['log_loss']:.4f}")
 
-        # choose best by cv score (higher is better because neg_log_loss)
         if float(gs.best_score_) > best_overall_score:
             best_overall_score = float(gs.best_score_)
             best_artifact = gs.best_estimator_
             best_model_name = name
 
-    # Save results and best model
-    artifact = {
-        "feature_cols": feat_cols,
-        "labels": list(encoder.classes_),
-        "competition": league,
-        "feature_version": FEATURE_VERSION,
-        "trained_at_utc": datetime.now(timezone.utc).isoformat(),
-        "best_model_name": best_model_name,
-        "best_cv_score_neg_logloss": float(best_overall_score),
-        "all_results": all_results
-    }
-
-    # Save the pipeline/model
-    joblib.dump(artifact, model_out)
-    # save the actual best estimator separately for inference
+    # ✅ *** FIX 2: Save the best pipeline directly ***
     if best_artifact is not None:
-        best_model_path = model_out.replace(".joblib", f"_{best_model_name}_estimator.joblib")
-        joblib.dump(best_artifact, best_model_path)
-        print(f"\n✅ Best estimator saved to: {best_model_path}")
+        print(f"\n🏆 Best model found: {best_model_name} (CV score: {best_overall_score:.4f})")
+        
+        # Save important metadata as attributes of the pipeline object itself
+        best_artifact.feature_version_ = FEATURE_VERSION
+        best_artifact.feature_cols_ = feat_cols
+        best_artifact.labels_ = list(encoder.classes_)
+        best_artifact.trained_at_utc_ = datetime.now(timezone.utc).isoformat()
+        best_artifact.training_league_ = league
 
-    print(f"\n✅ All metadata/results saved to: {model_out}")
-    return artifact
+        joblib.dump(best_artifact, model_out)
+        print(f"\n✅ Best pipeline saved directly to: {model_out}")
+
+        # Optionally save full metadata to a separate JSON for analysis
+        results_path = model_out.replace(".joblib", "_full_results.json")
+        for model_name, data in all_results.items():
+            if 'cv_results' in data:
+                for k, v in data['cv_results'].items():
+                    if isinstance(v, np.ndarray):
+                        data['cv_results'][k] = v.tolist()
+        
+        with open(results_path, 'w') as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        print(f"ℹ️ Full training metadata/results saved to: {results_path}")
+
+    else:
+        print("\n❌ No best model could be determined. Nothing was saved.")
+
+    return best_artifact
 
 
-def run_main(features_file="features_PL.csv", league="PL", model_out="best_grid_model.joblib"):
+def run_main(features_file="features_PL.csv", league="PL", model_out="best_model.joblib"):
     return run_training(features_file, league, model_out)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--features", type=str, default="features_PL.csv")
-    parser.add_argument("--league", type=str, default="PL")
-    parser.add_argument("--model-out", type=str, default="best_grid_model.joblib")
-    parser.add_argument("--cv-splits", type=int, default=3)
-    # ignore unknown args from Colab
+    parser.add_argument("--features", type=str, default="features_PL.csv", help="Input features CSV file.")
+    parser.add_argument("--league", type=str, default="PL", help="League code (e.g., PL, PD).")
+    parser.add_argument("--model-out", type=str, default="model.joblib", help="Path to save the final model pipeline.")
+    parser.add_argument("--cv-splits", type=int, default=3, help="Number of splits for TimeSeriesSplit CV.")
     args, unknown = parser.parse_known_args()
     run_training(args.features, args.league, args.model_out, cv_splits=args.cv_splits)
+
