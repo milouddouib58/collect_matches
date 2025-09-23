@@ -6,15 +6,15 @@ import pandas as pd
 import joblib
 import requests
 from datetime import datetime, timezone
+from importlib import import_module
 
 from features_lib import compute_single_pair_features, FEATURE_VERSION
 
 st.set_page_config(page_title="Football Match Predictor", page_icon="⚽")
 
-# تحميل مفتاح API
+# تحميل مفتاح API من Streamlit secrets أو المتغيرات البيئية
 if "FOOTBALL_DATA_API_KEY" in st.secrets and st.secrets["FOOTBALL_DATA_API_KEY"]:
     os.environ["FOOTBALL_DATA_API_KEY"] = st.secrets["FOOTBALL_DATA_API_KEY"]
-
 API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
 if not API_KEY:
     st.error("❌ API key not found! Please set FOOTBALL_DATA_API_KEY in Streamlit secrets or environment.")
@@ -39,32 +39,44 @@ def fetch_upcoming_matches(league_code: str) -> pd.DataFrame:
     matches = []
     for m in data.get("matches", []):
         matches.append({
-            "utcDate": m["utcDate"],
+            "utcDate": m.get("utcDate"),
             "homeTeam": (m.get("homeTeam") or {}).get("name"),
             "awayTeam": (m.get("awayTeam") or {}).get("name"),
-            "matchday": m.get("matchday")
+            "matchday": m.get("matchday"),
         })
     return pd.DataFrame(matches)
 
-@st.cache_resource
-def load_model(model_path: str):
-    # Hotfix: حقن الصنف الداخلي المفقود لكي ينجح unpickle
+def ensure_sklearn_unpickle_shims():
+    """
+    Hotfix: بعض النماذج المدرّبة بإصدارات قديمة من scikit-learn
+    تعتمد على صنف داخلي _RemainderColsList داخل ColumnTransformer.
+    في حال غيابه في بيئة التشغيل الحديثة، نُعرّفه كقائمة بسيطة.
+    """
     try:
-        import sklearn.compose._column_transformer as _ct
-        if not hasattr(_ct, "_RemainderColsList"):
+        ct_mod = import_module("sklearn.compose._column_transformer")
+        if not hasattr(ct_mod, "_RemainderColsList"):
             class _RemainderColsList(list):
                 pass
-            _ct._RemainderColsList = _RemainderColsList
+            ct_mod._RemainderColsList = _RemainderColsList
     except Exception:
+        # تجاهل بصمت؛ إن فشل الحقن، سيظهر الخطأ الأصلي لاحقًا برسالة أوضح
         pass
 
+@st.cache_resource
+def load_model(model_path: str):
+    # حقن الـ shim قبل التحميل
+    ensure_sklearn_unpickle_shims()
     try:
-        model = joblib.load(model_path)
-        return model
+        return joblib.load(model_path)
     except AttributeError as e:
         msg = str(e)
         if "_RemainderColsList" in msg:
-            st.error("Model load failed due to scikit-learn version mismatch. Pin the same scikit-learn version used in training (see requirements.txt), or retrain the model without ColumnTransformer.")
+            st.error(
+                "Failed to load model due to scikit-learn version mismatch. "
+                "Options: (1) Pin the same scikit-learn version used in training in requirements.txt and use Python 3.11, "
+                "(2) Retrain the model without ColumnTransformer (the provided train script does that), "
+                "(3) Or convert to .skops format."
+            )
         else:
             st.error(f"Failed to load model: {e}")
         raise
@@ -85,7 +97,6 @@ if matches_df.empty:
     st.warning("⚠️ No upcoming matches found for this league.")
     st.stop()
 
-# عرض المباريات للاختيار
 def fmt_match(row):
     try:
         dt = datetime.fromisoformat(row.utcDate.replace("Z", "+00:00"))
@@ -116,12 +127,10 @@ if st.button("🔮 Predict"):
     matches_hist = pd.read_csv(data_file)
     pipeline = load_model(model_file)
 
-    # تحذير في حال اختلاف نسخة الميزات
     model_feature_version = getattr(pipeline, "feature_version_", "Unknown")
     if model_feature_version != "Unknown" and model_feature_version != FEATURE_VERSION:
-        st.warning(f"Model feature version ({model_feature_version}) differs from code ({FEATURE_VERSION}).")
+        st.warning(f"Model feature version ({model_feature_version}) differs from code ({FEATURE_VERSION}). Consider retraining.")
 
-    # استخراج ميزات المباراة
     X, meta = compute_single_pair_features(
         matches=matches_hist,
         competition=league,
@@ -130,13 +139,11 @@ if st.button("🔮 Predict"):
         ref_datetime=ref_time
     )
 
-    # إعادة ترتيب الأعمدة إذا كانت موجودة
     if hasattr(pipeline, "feature_names_in_"):
         X = X.reindex(columns=pipeline.feature_names_in_, fill_value=0)
 
-    # التنبؤ بالاحتمالات
     proba = pipeline.predict_proba(X)[0]
-    classes_model = list(pipeline.classes_)  # يجب أن تكون ['A','D','H'] أو ترتيب مشابه
+    classes_model = list(pipeline.classes_)  # نصوص: "H/D/A"
     prob_map = {cls: float(p) for cls, p in zip(classes_model, proba)}
 
     p_home = prob_map.get("H", 0.0)
@@ -149,7 +156,10 @@ if st.button("🔮 Predict"):
     c2.metric("🤝 Draw", f"{p_draw:.1%}")
     c3.metric("🛫 Away Win", f"{p_away:.1%}")
 
-    outcome, conf = max([("Home Win", p_home), ("Draw", p_draw), ("Away Win", p_away)], key=lambda x: x[1])
+    outcome, conf = max(
+        [("Home Win", p_home), ("Draw", p_draw), ("Away Win", p_away)],
+        key=lambda x: x[1]
+    )
     st.success(f"Most likely outcome: {outcome} ({conf:.1%})")
 
     with st.expander("Details"):
@@ -160,4 +170,3 @@ if st.button("🔮 Predict"):
             "away_team_resolved": meta.get("away_team_resolved"),
             "feature_version_in_model": model_feature_version
         })
-
