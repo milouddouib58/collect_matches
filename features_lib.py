@@ -240,14 +240,27 @@ def engineer_match_features(matches: pd.DataFrame, competition: Optional[str] = 
     out = df.merge(home_feats[home_cols], on=["match_id", "home_team"], how="left") \
             .merge(away_feats[away_cols], on=["match_id", "away_team"], how="left")
 
+    # h2h لآخر 3 مواجهات قبل كل مباراة
     h2h_vals = out.apply(lambda r: compute_h2h_for_home(r, df, k=3), axis=1, result_type="expand")
     h2h_vals.columns = ["h2h_home_pts3", "h2h_home_avg_gf3", "h2h_home_avg_ga3"]
     out = pd.concat([out, h2h_vals], axis=1)
 
+    # فروقات عامة لكل ميزات الفريقين (حيث الأسماء متناظرة)
     for col_name in team_features:
         h_col, a_col = f"h_{col_name}", f"a_{col_name}"
         if h_col in out.columns and a_col in out.columns:
             out[f"diff_{col_name}"] = out[h_col] - out[a_col]
+
+    # فروقات المتوسطات الموسمية حسب الموقع (غير متناظرة في التسمية، لذلك تُحسب يدويًا)
+    if ("h_season_home_avg_gf" in out.columns) and ("a_season_away_avg_gf" in out.columns):
+        out["diff_season_avg_gf"] = out["h_season_home_avg_gf"] - out["a_season_away_avg_gf"]
+    else:
+        out["diff_season_avg_gf"] = np.nan
+
+    if ("h_season_home_avg_ga" in out.columns) and ("a_season_away_avg_ga" in out.columns):
+        out["diff_season_avg_ga"] = out["h_season_home_avg_ga"] - out["a_season_away_avg_ga"]
+    else:
+        out["diff_season_avg_ga"] = np.nan
 
     out["target"] = out.apply(lambda r: match_result_label(int(r["home_goals"]), int(r["away_goals"])), axis=1)
 
@@ -378,7 +391,7 @@ def compute_single_pair_features(
     out["h2h_home_avg_gf3"] = h2h_avg_gf
     out["h2h_home_avg_ga3"] = h2h_avg_ga
 
-    # فروقات diff_*
+    # فروقات diff_* (المتناظرة)
     time_windows = [3, 5, 10]
     metrics = ["pts", "gf", "ga", "win_rate", "cs_rate"]
     for w in time_windows:
@@ -386,6 +399,7 @@ def compute_single_pair_features(
             out[f"diff_{m}{w}"] = (out.get(f"h_{m}{w}", np.nan) - out.get(f"a_{m}{w}", np.nan))
             out[f"diff_ema_{m}{w}"] = (out.get(f"h_ema_{m}{w}", np.nan) - out.get(f"a_ema_{m}{w}", np.nan))
 
+    # الفروق غير المتناظرة (حسب الموقع)
     out["diff_season_avg_gf"] = (out.get("h_season_home_avg_gf", np.nan) - out.get("a_season_away_avg_gf", np.nan))
     out["diff_season_avg_ga"] = (out.get("h_season_home_avg_ga", np.nan) - out.get("a_season_away_avg_ga", np.nan))
     out["diff_days_since_last"] = (out.get("h_days_since_last", np.nan) - out.get("a_days_since_last", np.nan))
