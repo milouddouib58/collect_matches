@@ -1,3 +1,4 @@
+%%writefile features_lib.py
 # features_lib.py
 # -*- coding: utf-8 -*-
 import pandas as pd
@@ -9,8 +10,7 @@ from collections import defaultdict
 
 # ===================== أدوات مساعدة عامة =====================
 RESULT_LABELS = ["H", "D", "A"]
-FEATURE_VERSION = "v3" # <--- تم تحديث الإصدار
-
+FEATURE_VERSION = "v3" # الإصدار النهائي
 
 def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -19,23 +19,19 @@ def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("date").reset_index(drop=True)
     return df
 
-
 def match_result_label(home_goals: int, away_goals: int) -> str:
     if home_goals > away_goals: return "H"
     if home_goals < away_goals: return "A"
     return "D"
-
 
 def points_from_score(gf: int, ga: int) -> int:
     if gf > ga: return 3
     if gf == ga: return 1
     return 0
 
-
 def infer_season_start_for_date(ts: pd.Timestamp) -> str:
     y = ts.year if ts.month >= 7 else ts.year - 1
     return f"{y}-07-01"
-
 
 def list_feature_columns() -> List[str]:
     features = []
@@ -53,8 +49,8 @@ def list_feature_columns() -> List[str]:
             f"{side}_season_home_avg_ga" if side == 'h' else f"{side}_season_away_avg_ga",
             f"{side}_days_since_last",
             f"{side}_season_cum_gd",
-            f"{side}_ppg_vs_top5", # <--- NEW
-            f"{side}_ppg_vs_bot5", # <--- NEW
+            f"{side}_ppg_vs_top5",
+            f"{side}_ppg_vs_bot5",
         ])
 
     features.extend(["h2h_home_pts3", "h2h_home_avg_gf3", "h2h_home_avg_ga3"])
@@ -67,25 +63,13 @@ def list_feature_columns() -> List[str]:
     features.extend([
         "diff_season_avg_gf", "diff_season_avg_ga",
         "diff_days_since_last", "diff_season_cum_gd",
-        "diff_ppg_vs_top5", # <--- NEW
-        "diff_ppg_vs_bot5", # <--- NEW
+        "diff_ppg_vs_top5",
+        "diff_ppg_vs_bot5",
     ])
     
     return sorted(list(set(features)))
 
-
-def fuzzy_pick_team(user_input: str, valid_names: List[str]) -> str:
-    # ... (code unchanged)
-    if user_input in valid_names: return user_input
-    lower_map = {n.lower(): n for n in valid_names}
-    if user_input.lower() in lower_map: return lower_map[user_input.lower()]
-    candidates = get_close_matches(user_input, valid_names, n=1, cutoff=0.6)
-    return candidates[0] if candidates else user_input
-
-
-# ===================== بناء إطار مباريات الفريق =====================
 def build_team_matches_frame(matches: pd.DataFrame) -> pd.DataFrame:
-    # ... (code unchanged)
     req_cols = ["match_id", "date", "season_start", "matchday", "home_team", "away_team", "home_goals", "away_goals", "competition"]
     for c in req_cols:
         if c not in matches.columns: raise ValueError(f"العمود مفقود في البيانات: {c}")
@@ -99,9 +83,7 @@ def build_team_matches_frame(matches: pd.DataFrame) -> pd.DataFrame:
     tm = tm.sort_values(["team", "date", "match_id"]).reset_index(drop=True)
     return tm
 
-
 def add_rolling_team_features(team_matches: pd.DataFrame) -> pd.DataFrame:
-    # ... (code unchanged)
     tm = team_matches.copy().sort_values(["team", "date", "match_id"]).reset_index(drop=True)
     g = tm.groupby(["team", "competition"], sort=False)
     time_windows = [3, 5, 10]
@@ -123,151 +105,80 @@ def add_rolling_team_features(team_matches: pd.DataFrame) -> pd.DataFrame:
     loc_kg = kg + ["is_home"]
     tm["cum_gf_prev"] = tm.groupby(kg)["gf"].cumsum() - tm["gf"]
     tm["cum_ga_prev"] = tm.groupby(kg)["ga"].cumsum() - tm["ga"]
-    tm["count_prev"] = tm.groupby(kg).cumcount()
     tm["season_cum_gd"] = tm["cum_gf_prev"] - tm["cum_ga_prev"]
     loc_counts = tm.groupby(loc_kg).cumcount()
     tm["season_loc_avg_gf"] = (tm.groupby(loc_kg)["gf"].cumsum() - tm["gf"]) / loc_counts
     tm["season_loc_avg_ga"] = (tm.groupby(loc_kg)["ga"].cumsum() - tm["ga"]) / loc_counts
-    tm["season_loc_avg_gf"].replace([np.inf, -np.inf], np.nan, inplace=True)
-    tm["season_loc_avg_ga"].replace([np.inf, -np.inf], np.nan, inplace=True)
+    tm.replace([np.inf, -np.inf], np.nan, inplace=True)
     return tm
 
-# <--- NEW: START OF NEW FUNCTIONS FOR RANK-BASED FEATURES --->
 def get_season_final_ranks(matches: pd.DataFrame) -> Dict[str, Dict[str, int]]:
-    """
-    Computes final league table ranks for each season in the dataset.
-    Returns a dict mapping season_start -> {team_name: rank}.
-    """
     ranks_by_season = {}
-    
-    # Ensure date is parsed
     matches = parse_dates(matches)
-    
     for season_start, season_df in matches.groupby("season_start"):
         table = defaultdict(lambda: {'pts': 0, 'gd': 0, 'gf': 0})
-        
         for row in season_df.itertuples():
-            h, a = row.home_team, row.away_team
-            hg, ag = row.home_goals, row.away_goals
-
-            # Update home team
-            table[h]['pts'] += points_from_score(hg, ag)
-            table[h]['gd'] += hg - ag
-            table[h]['gf'] += hg
-            
-            # Update away team
-            table[a]['pts'] += points_from_score(ag, hg)
-            table[a]['gd'] += ag - hg
-            table[a]['gf'] += ag
-
+            h, a, hg, ag = row.home_team, row.away_team, row.home_goals, row.away_goals
+            table[h]['pts'] += points_from_score(hg, ag); table[h]['gd'] += hg - ag; table[h]['gf'] += hg
+            table[a]['pts'] += points_from_score(ag, hg); table[a]['gd'] += ag - hg; table[a]['gf'] += ag
         sorted_table = sorted(table.items(), key=lambda item: (item[1]['pts'], item[1]['gd'], item[1]['gf']), reverse=True)
-        
         ranks = {team: i + 1 for i, (team, stats) in enumerate(sorted_table)}
         ranks_by_season[season_start] = ranks
-        
     return ranks_by_season
 
 def add_performance_vs_ranks_features(team_matches: pd.DataFrame, season_ranks: Dict[str, Dict[str, int]]) -> pd.DataFrame:
-    """
-    Calculates rolling points-per-game against top/bottom teams from previous season.
-    """
     tm = team_matches.copy()
-    
-    # Get previous season's ranks for each opponent
     tm['prev_season_start'] = (pd.to_datetime(tm['season_start']).dt.year - 1).astype(str) + "-07-01"
-    tm['opponent_rank_prev_season'] = tm.apply(
-        lambda r: season_ranks.get(r['prev_season_start'], {}).get(r['opponent'], 20), axis=1 # Default to 20 for promoted
-    )
-
-    # Classify opponent strength
-    tm['opponent_strength'] = pd.cut(
-        tm['opponent_rank_prev_season'],
-        bins=[0, 5, 15, 21], # Bins: 1-5 (top5), 6-15 (mid), 16-20 (bot5)
-        labels=['top5', 'mid', 'bot5'],
-        right=True
-    )
-    
-    # Calculate rolling PPG vs. each strength category
+    tm['opponent_rank_prev_season'] = tm.apply(lambda r: season_ranks.get(r['prev_season_start'], {}).get(r['opponent'], 20), axis=1)
+    tm['opponent_strength'] = pd.cut(tm['opponent_rank_prev_season'], bins=[0, 5, 15, 21], labels=['top5', 'mid', 'bot5'])
     tm['points_vs_top5'] = tm.where(tm['opponent_strength'] == 'top5')['points']
     tm['points_vs_bot5'] = tm.where(tm['opponent_strength'] == 'bot5')['points']
-    
     g = tm.groupby(['team', 'season_start'])
-    
-    cum_pts_vs_top5 = g['points_vs_top5'].cumsum()
-    cum_games_vs_top5 = g['points_vs_top5'].count().cumsum()
-    
-    cum_pts_vs_bot5 = g['points_vs_bot5'].cumsum()
-    cum_games_vs_bot5 = g['points_vs_bot5'].count().cumsum()
-    
-    # Shift to prevent data leakage
     prev_cum_pts_vs_top5 = g['points_vs_top5'].shift(1).fillna(0).cumsum()
-    prev_cum_games_vs_top5 = g['points_vs_top5'].shift(1).fillna(0).count().cumsum()
-    
+    prev_cum_games_vs_top5 = g['points_vs_top5'].shift(1).notna().cumsum()
     prev_cum_pts_vs_bot5 = g['points_vs_bot5'].shift(1).fillna(0).cumsum()
-    prev_cum_games_vs_bot5 = g['points_vs_bot5'].shift(1).fillna(0).count().cumsum()
-
+    prev_cum_games_vs_bot5 = g['points_vs_bot5'].shift(1).notna().cumsum()
     tm['ppg_vs_top5'] = prev_cum_pts_vs_top5 / prev_cum_games_vs_top5
     tm['ppg_vs_bot5'] = prev_cum_pts_vs_bot5 / prev_cum_games_vs_bot5
-    
-    tm.fillna({'ppg_vs_top5': 0, 'ppg_vs_bot5': 0}, inplace=True) # Fill NaN for teams that haven't played a category yet
-
+    tm.fillna({'ppg_vs_top5': 0, 'ppg_vs_bot5': 0}, inplace=True)
     return tm
 
-# <--- NEW: END OF NEW FUNCTIONS --->
-
-# ===================== تجميع الميزات على مستوى المباراة =====================
 def engineer_match_features(matches: pd.DataFrame, competition: Optional[str] = None) -> pd.DataFrame:
     df = matches.copy()
     if competition: df = df[df["competition"] == competition].copy()
     df = parse_dates(df).dropna(subset=["home_goals", "away_goals"])
-
-    # <--- NEW: Pre-compute ranks for all seasons --->
     season_final_ranks = get_season_final_ranks(df)
-    
     tm = build_team_matches_frame(df)
     tm = add_rolling_team_features(tm)
-    
-    # <--- NEW: Add rank-based performance features --->
     tm = add_performance_vs_ranks_features(tm, season_final_ranks)
-
-    # ... (rest of the function is the same, but now it will pick up the new features)
     all_feature_cols = list_feature_columns()
     team_features = sorted(list(set([c.split('_', 1)[1] for c in all_feature_cols if c.startswith(('h_', 'a_'))])))
-    home_feats = tm[tm["is_home"]].copy()
-    away_feats = tm[~tm["is_home"]].copy()
-    home_map = {feat: f"h_{feat}" for feat in team_features}
-    away_map = {feat: f"a_{feat}" for feat in team_features}
+    home_feats = tm[tm["is_home"]].copy(); away_feats = tm[~tm["is_home"]].copy()
+    home_map = {feat: f"h_{feat}" for feat in team_features}; away_map = {feat: f"a_{feat}" for feat in team_features}
     home_map.update({"team": "home_team", "season_loc_avg_gf": "h_season_home_avg_gf", "season_loc_avg_ga": "h_season_home_avg_ga"})
     away_map.update({"team": "away_team", "season_loc_avg_gf": "a_season_away_avg_gf", "season_loc_avg_ga": "a_season_away_avg_ga"})
-    home_feats.rename(columns=home_map, inplace=True)
-    away_feats.rename(columns=away_map, inplace=True)
-    home_cols = ['match_id', 'home_team'] + [f'h_{f}' for f in team_features if f'h_{f}' in home_feats.columns]
-    away_cols = ['match_id', 'away_team'] + [f'a_{f}' for f in team_features if f'a_{f}' in away_feats.columns]
-    out = df.merge(home_feats[home_cols], on=["match_id", "home_team"], how="left") \
-            .merge(away_feats[away_cols], on=["match_id", "away_team"], how="left")
-
+    home_feats.rename(columns=home_map, inplace=True); away_feats.rename(columns=away_map, inplace=True)
+    home_cols = ['match_id', 'home_team'] + [c for c in home_feats.columns if c.startswith('h_')]
+    away_cols = ['match_id', 'away_team'] + [c for c in away_feats.columns if c.startswith('a_')]
+    out = df.merge(home_feats[home_cols], on=["match_id", "home_team"], how="left").merge(away_feats[away_cols], on=["match_id", "away_team"], how="left")
     h2h_vals = out.apply(lambda r: compute_h2h_for_home(r, df, k=3), axis=1, result_type="expand")
     h2h_vals.columns = ["h2h_home_pts3", "h2h_home_avg_gf3", "h2h_home_avg_ga3"]
     out = pd.concat([out, h2h_vals], axis=1)
-
     for col_name in team_features:
-        h_col = f"h_{col_name}"
-        a_col = f"a_{col_name}"
+        h_col, a_col = f"h_{col_name}", f"a_{col_name}"
         if h_col in out.columns and a_col in out.columns:
             out[f"diff_{col_name}"] = out[h_col] - out[a_col]
-
     out["target"] = out.apply(lambda r: match_result_label(int(r["home_goals"]), int(r["away_goals"])), axis=1)
-    final_cols = ["match_id", "date", "season_start", "matchday", "competition", "home_team", "away_team"] + list_feature_columns() + ["target"]
+    final_cols = ["match_id", "date", "season_start", "competition", "home_team", "away_team"] + list_feature_columns() + ["target"]
     final_cols = [c for c in final_cols if c in out.columns]
     return out[final_cols].sort_values("date").reset_index(drop=True)
 
-# ... (H2H function and single pair prediction function remain)
 def compute_h2h_for_home(row: pd.Series, matches: pd.DataFrame, k: int = 3) -> Tuple[float, float, float]:
-    comp, home, away, dt = row["competition"], row["home_team"], row["away_team"], row["date"]
-    prev = matches[(matches["competition"] == comp) & (matches["date"] < dt) & (((matches["home_team"] == home) & (matches["away_team"] == away)) | ((matches["home_team"] == away) & (matches["away_team"] == home)))].sort_values("date", ascending=False).head(k)
+    comp, home, away, dt = row.competition, row.home_team, row.away_team, row.date
+    prev = matches[(matches.competition == comp) & (matches.date < dt) & (((matches.home_team == home) & (matches.away_team == away)) | ((matches.home_team == away) & (matches.away_team == home)))].sort_values("date", ascending=False).head(k)
     if prev.empty: return (np.nan, np.nan, np.nan)
     pts, gf_sum, ga_sum = 0, 0.0, 0.0
     for _, m in prev.iterrows():
-        gf, ga = (m["home_goals"], m["away_goals"]) if m["home_team"] == home else (m["away_goals"], m["home_goals"])
+        gf, ga = (m.home_goals, m.away_goals) if m.home_team == home else (m.away_goals, m.home_goals)
         gf_sum += gf; ga_sum += ga; pts += points_from_score(gf, ga)
     return (float(pts), gf_sum / len(prev), ga_sum / len(prev))
