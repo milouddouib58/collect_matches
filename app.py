@@ -48,11 +48,28 @@ def fetch_upcoming_matches(league_code: str) -> pd.DataFrame:
 
 @st.cache_resource
 def load_model(model_path: str):
+    # Hotfix: حقن الصنف الداخلي المفقود لكي ينجح unpickle
+    try:
+        import sklearn.compose._column_transformer as _ct
+        if not hasattr(_ct, "_RemainderColsList"):
+            class _RemainderColsList(list):
+                pass
+            _ct._RemainderColsList = _RemainderColsList
+    except Exception:
+        pass
+
     try:
         model = joblib.load(model_path)
         return model
+    except AttributeError as e:
+        msg = str(e)
+        if "_RemainderColsList" in msg:
+            st.error("Model load failed due to scikit-learn version mismatch. Pin the same scikit-learn version used in training (see requirements.txt), or retrain the model without ColumnTransformer.")
+        else:
+            st.error(f"Failed to load model: {e}")
+        raise
     except Exception as e:
-        st.error(f"Failed to load model from {model_path}: {e}")
+        st.error(f"Failed to load model: {e}")
         raise
 
 st.title("⚽ Football Match Predictor")
@@ -143,3 +160,4 @@ if st.button("🔮 Predict"):
             "away_team_resolved": meta.get("away_team_resolved"),
             "feature_version_in_model": model_feature_version
         })
+
