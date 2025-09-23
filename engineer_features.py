@@ -4,7 +4,6 @@ import argparse
 import pandas as pd
 from features_lib import engineer_match_features, list_feature_columns, FEATURE_VERSION
 
-
 def main():
     parser = argparse.ArgumentParser(description="هندسة ميزات من ملف المباريات إلى ملف ميزات للتدريب.")
     parser.add_argument("--input", type=str, default="matches_data.csv", help="مسار ملف المباريات CSV")
@@ -21,7 +20,5 @@ def main():
     print(f"- عدد الأسطر: {len(feats)} | عدد الميزات: {len(list_feature_columns())}")
     print(f"- نسخة الميزات: {FEATURE_VERSION}")
 
-
 if __name__ == "__main__":
     main()
-
