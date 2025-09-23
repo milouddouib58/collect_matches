@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
 from difflib import get_close_matches
 from typing import Tuple, List, Dict, Optional, Any
 
@@ -35,10 +34,6 @@ def points_from_score(gf: int, ga: int) -> int:
         return 1
     return 0
 
-def infer_season_start_for_date(ts: pd.Timestamp) -> str:
-    y = ts.year if ts.month >= 7 else ts.year - 1
-    return f"{y}-07-01"
-
 def list_feature_columns() -> List[str]:
     features: List[str] = []
     time_windows = [3, 5, 10]
@@ -50,17 +45,10 @@ def list_feature_columns() -> List[str]:
                 features.append(f"{side}_{metric}{w}")
                 features.append(f"{side}_ema_{metric}{w}")
 
-        # ميزات إضافية لكل جانب
         if side == "h":
-            features.extend([
-                "h_season_home_avg_gf",
-                "h_season_home_avg_ga",
-            ])
+            features.extend(["h_season_home_avg_gf", "h_season_home_avg_ga"])
         else:
-            features.extend([
-                "a_season_away_avg_gf",
-                "a_season_away_avg_ga",
-            ])
+            features.extend(["a_season_away_avg_gf", "a_season_away_avg_ga"])
 
         features.extend([
             f"{side}_days_since_last",
@@ -69,10 +57,8 @@ def list_feature_columns() -> List[str]:
             f"{side}_ppg_vs_bot5",
         ])
 
-    # ميزات المواجهات المباشرة
     features.extend(["h2h_home_pts3", "h2h_home_avg_gf3", "h2h_home_avg_ga3"])
 
-    # فروقات
     for metric in metrics:
         for w in time_windows:
             features.append(f"diff_{metric}{w}")
@@ -91,28 +77,22 @@ def list_feature_columns() -> List[str]:
 
 # ===================== بناء إطار مباريات الفرق =====================
 def build_team_matches_frame(matches: pd.DataFrame) -> pd.DataFrame:
-    req_cols = ["match_id", "date", "season_start", "matchday", "home_team", "away_team", "home_goals", "away_goals", "competition"]
-    for c in req_cols:
+    req = ["match_id", "date", "season_start", "matchday", "home_team", "away_team", "home_goals", "away_goals", "competition"]
+    for c in req:
         if c not in matches.columns:
             raise ValueError(f"العمود مفقود في البيانات: {c}")
 
     m = parse_dates(matches.copy())
 
-    home = m[req_cols].rename(columns={
-        "home_team": "team",
-        "away_team": "opponent",
-        "home_goals": "gf",
-        "away_goals": "ga"
-    })
-    home["is_home"] = True
+    home = m[req].rename(columns={
+        "home_team": "team", "away_team": "opponent",
+        "home_goals": "gf", "away_goals": "ga"
+    }); home["is_home"] = True
 
-    away = m[req_cols].rename(columns={
-        "away_team": "team",
-        "home_team": "opponent",
-        "away_goals": "gf",
-        "home_goals": "ga"
-    })
-    away["is_home"] = False
+    away = m[req].rename(columns={
+        "away_team": "team", "home_team": "opponent",
+        "away_goals": "gf", "home_goals": "ga"
+    }); away["is_home"] = False
 
     tm = pd.concat([home, away], ignore_index=True)
     tm["points"] = tm.apply(lambda r: points_from_score(r["gf"], r["ga"]), axis=1)
@@ -166,7 +146,7 @@ def get_season_final_ranks(matches: pd.DataFrame) -> Dict[str, Dict[str, int]]:
             table[h]['pts'] += points_from_score(hg, ag); table[h]['gd'] += hg - ag; table[h]['gf'] += hg
             table[a]['pts'] += points_from_score(ag, hg); table[a]['gd'] += ag - hg; table[a]['gf'] += ag
         sorted_table = sorted(table.items(), key=lambda item: (item[1]['pts'], item[1]['gd'], item[1]['gf']), reverse=True)
-        ranks = {team: i + 1 for i, (team, stats) in enumerate(sorted_table)}
+        ranks = {team: i + 1 for i, (team, _) in enumerate(sorted_table)}
         ranks_by_season[season_start] = ranks
     return ranks_by_season
 
@@ -186,21 +166,15 @@ def add_performance_vs_ranks_features(team_matches: pd.DataFrame, season_ranks: 
 
     tm['ppg_vs_top5'] = prev_cum_pts_vs_top5 / prev_cum_games_vs_top5
     tm['ppg_vs_bot5'] = prev_cum_pts_vs_bot5 / prev_cum_games_vs_bot5
-
     tm.fillna({'ppg_vs_top5': 0, 'ppg_vs_bot5': 0}, inplace=True)
     return tm
 
-# ===================== هندسة الميزات للمباريات التاريخية =====================
 def compute_h2h_for_home(row: pd.Series, matches: pd.DataFrame, k: int = 3) -> Tuple[float, float, float]:
     comp, home, away, dt = row.competition, row.home_team, row.away_team, row.date
-    prev = matches[
-        (matches.competition == comp) &
-        (matches.date < dt) &
-        (
-            ((matches.home_team == home) & (matches.away_team == away)) |
-            ((matches.home_team == away) & (matches.away_team == home))
-        )
-    ].sort_values("date", ascending=False).head(k)
+    prev = matches[(matches.competition == comp) & (matches.date < dt) & (
+        ((matches.home_team == home) & (matches.away_team == away)) |
+        ((matches.home_team == away) & (matches.away_team == home))
+    )].sort_values("date", ascending=False).head(k)
     if prev.empty:
         return (np.nan, np.nan, np.nan)
     pts, gf_sum, ga_sum = 0, 0.0, 0.0
@@ -240,23 +214,20 @@ def engineer_match_features(matches: pd.DataFrame, competition: Optional[str] = 
     out = df.merge(home_feats[home_cols], on=["match_id", "home_team"], how="left") \
             .merge(away_feats[away_cols], on=["match_id", "away_team"], how="left")
 
-    # h2h لآخر 3 مواجهات قبل كل مباراة
     h2h_vals = out.apply(lambda r: compute_h2h_for_home(r, df, k=3), axis=1, result_type="expand")
     h2h_vals.columns = ["h2h_home_pts3", "h2h_home_avg_gf3", "h2h_home_avg_ga3"]
     out = pd.concat([out, h2h_vals], axis=1)
 
-    # فروقات عامة لكل ميزات الفريقين (حيث الأسماء متناظرة)
     for col_name in team_features:
         h_col, a_col = f"h_{col_name}", f"a_{col_name}"
         if h_col in out.columns and a_col in out.columns:
             out[f"diff_{col_name}"] = out[h_col] - out[a_col]
 
-    # فروقات المتوسطات الموسمية حسب الموقع (غير متناظرة في التسمية، لذلك تُحسب يدويًا)
+    # فروقات غير متناظرة حسب الموقع
     if ("h_season_home_avg_gf" in out.columns) and ("a_season_away_avg_gf" in out.columns):
         out["diff_season_avg_gf"] = out["h_season_home_avg_gf"] - out["a_season_away_avg_gf"]
     else:
         out["diff_season_avg_gf"] = np.nan
-
     if ("h_season_home_avg_ga" in out.columns) and ("a_season_away_avg_ga" in out.columns):
         out["diff_season_avg_ga"] = out["h_season_home_avg_ga"] - out["a_season_away_avg_ga"]
     else:
@@ -306,11 +277,8 @@ def compute_single_pair_features(
     away_team_input: str,
     ref_datetime: Any
 ) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """
-    استخراج ميزات مباراة واحدة قبل ref_datetime بنَفَس منطق engineer_match_features.
-    """
-    req_cols = ["match_id", "date", "season_start", "matchday", "home_team", "away_team", "home_goals", "away_goals", "competition"]
-    for c in req_cols:
+    req = ["match_id", "date", "season_start", "matchday", "home_team", "away_team", "home_goals", "away_goals", "competition"]
+    for c in req:
         if c not in matches.columns:
             raise ValueError(f"العمود مفقود في البيانات: {c}")
 
@@ -322,18 +290,15 @@ def compute_single_pair_features(
     ref_ts = _to_utc(ref_datetime)
     hist = df[df["date"] < ref_ts].copy()
 
-    # لا توجد بيانات تاريخية
     cols = list_feature_columns()
     if hist.empty:
         X_empty = pd.DataFrame([np.nan] * len(cols), index=cols).T
         return X_empty, {"home_team_resolved": home_team_input, "away_team_resolved": away_team_input}
 
-    # حل الأسماء
     team_pool = sorted(set(hist["home_team"]).union(set(hist["away_team"])))
     home_res = _resolve_team_name(home_team_input, team_pool)
     away_res = _resolve_team_name(away_team_input, team_pool)
 
-    # بناء ميزات الفرق
     season_final_ranks = get_season_final_ranks(hist)
     tm = build_team_matches_frame(hist)
     tm = add_rolling_team_features(tm)
@@ -374,24 +339,16 @@ def compute_single_pair_features(
             return np.nan
         return row_all.get(feat_suffix, np.nan)
 
-    # تعبئة h_* و a_*
     for feat in team_features:
         out[f"h_{feat}"] = get_feat_from_rows(feat, "h")
         out[f"a_{feat}"] = get_feat_from_rows(feat, "a")
 
-    # h2h قبل ref_ts
-    h2h_series = pd.Series({
-        "competition": competition,
-        "home_team": home_res,
-        "away_team": away_res,
-        "date": ref_ts
-    })
+    h2h_series = pd.Series({"competition": competition, "home_team": home_res, "away_team": away_res, "date": ref_ts})
     h2h_pts, h2h_avg_gf, h2h_avg_ga = compute_h2h_for_home(h2h_series, hist, k=3)
     out["h2h_home_pts3"] = h2h_pts
     out["h2h_home_avg_gf3"] = h2h_avg_gf
     out["h2h_home_avg_ga3"] = h2h_avg_ga
 
-    # فروقات diff_* (المتناظرة)
     time_windows = [3, 5, 10]
     metrics = ["pts", "gf", "ga", "win_rate", "cs_rate"]
     for w in time_windows:
@@ -399,7 +356,6 @@ def compute_single_pair_features(
             out[f"diff_{m}{w}"] = (out.get(f"h_{m}{w}", np.nan) - out.get(f"a_{m}{w}", np.nan))
             out[f"diff_ema_{m}{w}"] = (out.get(f"h_ema_{m}{w}", np.nan) - out.get(f"a_ema_{m}{w}", np.nan))
 
-    # الفروق غير المتناظرة (حسب الموقع)
     out["diff_season_avg_gf"] = (out.get("h_season_home_avg_gf", np.nan) - out.get("a_season_away_avg_gf", np.nan))
     out["diff_season_avg_ga"] = (out.get("h_season_home_avg_ga", np.nan) - out.get("a_season_away_avg_ga", np.nan))
     out["diff_days_since_last"] = (out.get("h_days_since_last", np.nan) - out.get("a_days_since_last", np.nan))
@@ -407,15 +363,11 @@ def compute_single_pair_features(
     out["diff_ppg_vs_top5"] = (out.get("h_ppg_vs_top5", np.nan) - out.get("a_ppg_vs_top5", np.nan))
     out["diff_ppg_vs_bot5"] = (out.get("h_ppg_vs_bot5", np.nan) - out.get("a_ppg_vs_bot5", np.nan))
 
-    # DataFrame بترتيب الأعمدة
     X = pd.DataFrame([out])
     for c in all_feature_cols:
         if c not in X.columns:
             X[c] = np.nan
     X = X[all_feature_cols]
 
-    meta = {
-        "home_team_resolved": home_res,
-        "away_team_resolved": away_res
-    }
+    meta = {"home_team_resolved": home_res, "away_team_resolved": away_res}
     return X, meta
