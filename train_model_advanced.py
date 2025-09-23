@@ -4,6 +4,7 @@ import argparse
 import random
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -81,10 +82,10 @@ def run_training(features_file: str, league: str, model_out: str, cv_splits=3, s
     df = pd.read_csv(features_file).dropna(subset=["target"])
     feat_cols = list_feature_columns()
 
-    # التدريب على الفئات النصية مباشرة ("H","D","A")
+    # استخدم reindex لضمان وجود كل الأعمدة (المفقودة تُملأ NaN ويعالجها الـ Imputer)
     train_df, test_df = temporal_train_test_split(df)
-    X_train, y_train = train_df[feat_cols], train_df["target"]
-    X_test, y_test = test_df[feat_cols], test_df["target"]
+    X_train, y_train = train_df.reindex(columns=feat_cols), train_df["target"]
+    X_test, y_test = test_df.reindex(columns=feat_cols), test_df["target"]
 
     preproc = make_preprocessor(feat_cols)
     models_and_grids = build_models_and_grids(preproc)
@@ -138,16 +139,27 @@ def run_training(features_file: str, league: str, model_out: str, cv_splits=3, s
     with open(model_out.replace(".joblib", "_metadata.json"), 'w', encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
 
-def main():
+def get_arg_parser():
     parser = argparse.ArgumentParser(description="Train ensemble model for match outcome prediction.")
-    parser.add_argument("--features-file", type=str, required=True, help="Path to engineered features CSV")
+    parser.add_argument("--features-file", type=str, default=None, help="Path to engineered features CSV (default: features_{league}.csv)")
     parser.add_argument("--league", type=str, default="PL", help="League code (PL, PD, SA, BL1, FL1...)")
     parser.add_argument("--model-out", type=str, default="ensemble_model_v3_PL.joblib", help="Output path for the model")
     parser.add_argument("--cv-splits", type=int, default=3)
-    args = parser.parse_args()
+    return parser
+
+def main(argv=None):
+    parser = get_arg_parser()
+    # استخدام parse_known_args لتجاهل -f من كولاب/جوبتر
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        print(f"Ignoring unknown args (likely from Jupyter): {unknown}")
+
+    features_file = args.features_file or f"features_{args.league}.csv"
+    if not Path(features_file).exists():
+        raise FileNotFoundError(f"Features file not found: {features_file}. Generate it with engineer_features.py first.")
 
     run_training(
-        features_file=args.features_file,
+        features_file=features_file,
         league=args.league,
         model_out=args.model_out,
         cv_splits=args.cv_splits,
