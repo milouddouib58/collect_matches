@@ -1,4 +1,3 @@
-%%writefile train_model_advanced.py
 # train_model_advanced.py
 # -*- coding: utf-8 -*-
 import argparse
@@ -9,12 +8,14 @@ import numpy as np
 import pandas as pd
 import joblib
 
+# لضمان تكرارية النتائج
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 
+# استيراد مكتبات تعلم الآلة
 from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
+from sklearn.impute import SimpleImputer # <--- هذه الأداة تعالج القيم الفارغة
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import log_loss
@@ -23,6 +24,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.neural_network import MLPClassifier
 
+# استيراد النماذج المتقدمة إن كانت مثبتة
 try:
     from xgboost import XGBClassifier
     XGB_AVAILABLE = True
@@ -34,17 +36,30 @@ try:
 except ImportError:
     LGBM_AVAILABLE = False
 
+# استيراد دوال المشروع المساعدة
 from features_lib import list_feature_columns, FEATURE_VERSION
 
 def temporal_train_test_split(df: pd.DataFrame, test_size: float = 0.2):
+    """يقسم البيانات زمنياً لضمان عدم تسرب المستقبل إلى الماضي."""
     df_sorted = df.sort_values("date").reset_index(drop=True)
     split_index = int(round(len(df_sorted) * (1 - test_size)))
     return df_sorted.iloc[:split_index], df_sorted.iloc[split_index:]
 
 def make_preprocessor(feature_cols):
-    return ColumnTransformer(transformers=[("num", Pipeline(steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]), feature_cols)])
+    """
+    إنشاء خط أنابيب المعالجة المسبقة للبيانات الرقمية.
+    الخطوة 1: SimpleImputer لملء القيم الفارغة (NaN) بالوسيط.
+    الخطوة 2: StandardScaler لتوحيد مقياس الميزات.
+    """
+    return ColumnTransformer(transformers=[
+        ("num", Pipeline(steps=[
+            ("imputer", SimpleImputer(strategy="median")), # <--- هنا يتم تعريف معالجة القيم الفارغة
+            ("scaler", StandardScaler())
+        ]), feature_cols)
+    ])
 
 def build_models_and_grids(preproc):
+    """بناء قائمة النماذج مع شبكات البحث الخاصة بها."""
     models = {}
     models["logreg"] = (Pipeline([("preproc", preproc), ("clf", LogisticRegression(max_iter=2000, random_state=SEED))]), {"clf__C": [0.01, 0.1, 1.0]})
     models["rf"] = (Pipeline([("preproc", preproc), ("clf", RandomForestClassifier(random_state=SEED, n_jobs=-1))]), {"clf__n_estimators": [100, 300], "clf__max_depth": [10, 20]})
@@ -54,9 +69,12 @@ def build_models_and_grids(preproc):
     return models
 
 def run_training(features_file, league, model_out, cv_splits=3, scoring="neg_log_loss"):
+    """الدالة الرئيسية لتشغيل عملية التدريب بالكامل."""
     df = pd.read_csv(features_file).dropna(subset=["target"])
     feat_cols = list_feature_columns()
-    df.dropna(subset=feat_cols, how='any', inplace=True)
+    
+    # لا يوجد سطر dropna هنا، مما يسمح للمعالج المسبق بالتعامل مع القيم الفارغة
+    
     encoder = LabelEncoder()
     df["target_encoded"] = encoder.fit_transform(df["target"])
     train_df, test_df = temporal_train_test_split(df)
