@@ -1,0 +1,575 @@
+# -*- coding: utf-8 -*-
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+import inspect
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score, f1_score,
+    classification_report, confusion_matrix, log_loss
+)
+from sklearn.utils.class_weight import compute_class_weight
+from dataclasses import dataclass
+import joblib
+from typing import Dict, List, Optional, Tuple
+
+# ================== إعدادات عامة ==================
+INPUT_CSV_FILE = "historical_dataset.csv"
+MODEL_OUTPUT_FILE = "football_model_two_stage.joblib"
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+# بحث وضبط
+N_TRIALS_STAGE1 = 10  # Draw vs NotDraw
+N_TRIALS_STAGE2 = 10  # Home vs Away
+DRAW_WEIGHT_GRID = [1.5, 2.0, 2.5, 3.0]
+K_SELECTIVE_GRID = [0.0, 0.6]  # تعزيز انتقائي للتعادلات القريبة
+TAU_GRID = np.linspace(0.32, 0.52, 21)  # عتبة p_draw
+GAMMA_GRID = np.linspace(0.55, 0.75, 9)  # عتبة التقارب
+ACC_DROP_ALLOWED = 0.01  # مسموح نزول بسيط في الدقة <= 1%
+
+# ================== توافق الإيقاف المبكر ==================
+def detect_es_mode() -> str:
+    dummy = xgb.XGBClassifier()
+    sig = inspect.signature(dummy.fit)
+    if 'early_stopping_rounds' in sig.parameters:
+        return 'early_stopping_rounds'
+    if 'callbacks' in sig.parameters:
+        return 'callbacks'
+    return 'none'
+ES_MODE = detect_es_mode()
+N_ESTIMATORS_RS = 3000 if ES_MODE in ('early_stopping_rounds', 'callbacks') else 800
+
+def xgb_fit_with_es(model, X_train, y_train, sw_train, X_val, y_val, es_rounds=150):
+    kwargs = dict(sample_weight=sw_train, eval_set=[(X_val, y_val)])
+    if 'verbose' in inspect.signature(model.fit).parameters:
+        kwargs['verbose'] = False
+    if ES_MODE == 'early_stopping_rounds':
+        kwargs['early_stopping_rounds'] = es_rounds
+    elif ES_MODE == 'callbacks':
+        try:
+            from xgboost.callback import EarlyStopping
+            kwargs['callbacks'] = [EarlyStopping(rounds=es_rounds, save_best=True)]
+        except Exception:
+            pass
+    return model.fit(X_train, y_train, **kwargs)
+
+def get_best_iteration(model) -> Optional[int]:
+    bi = getattr(model, "best_iteration", None)
+    if bi is not None:
+        return int(bi)
+    try:
+        booster = model.get_booster()
+        if hasattr(booster, "best_iteration") and booster.best_iteration is not None:
+            return int(booster.best_iteration)
+        if hasattr(booster, "best_ntree_limit") and booster.best_ntree_limit is not None:
+            return int(booster.best_ntree_limit)
+    except Exception:
+        pass
+    return None
+
+# ================== تقسيم زمني ==================
+def time_split_by_day(df: pd.DataFrame, train_frac=0.70, val_frac=0.15):
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df.dropna(subset=['date']).sort_values('date').reset_index(drop=True)
+    df['day'] = df['date'].dt.normalize()
+
+    unique_days = pd.Series(df['day'].unique()).sort_values().to_list()
+    n_days = len(unique_days)
+    if n_days < 10:
+        n = len(df)
+        tr_end = max(1, int(n * train_frac))
+        va_end = max(tr_end + 1, int(n * (train_frac + val_frac)))
+        va_end = min(va_end, n - 1)
+        return df.iloc[:tr_end].copy(), df.iloc[tr_end:va_end].copy(), df.iloc[va_end:].copy()
+
+    tr_end_day = max(1, int(n_days * train_frac))
+    va_end_day = max(tr_end_day + 1, int(n_days * (train_frac + val_frac)))
+    va_end_day = min(va_end_day, n_days - 1)
+
+    train_days = set(unique_days[:tr_end_day])
+    val_days = set(unique_days[tr_end_day:va_end_day])
+    test_days = set(unique_days[va_end_day:])
+
+    df_train = df[df['day'].isin(train_days)].drop(columns=['day'])
+    df_val = df[df['day'].isin(val_days)].drop(columns=['day'])
+    df_test = df[df['day'].isin(test_days)].drop(columns=['day'])
+    return df_train.reset_index(drop=True), df_val.reset_index(drop=True), df_test.reset_index(drop=True)
+
+# ================== معايرة ==================
+@dataclass
+class TemperatureScaler:
+    T: float = 1.0
+    eps: float = 1e-12
+    def fit(self, proba: np.ndarray, y_true: np.ndarray):
+        y_true = np.asarray(y_true)
+        proba = np.clip(proba, self.eps, 1 - self.eps)
+        grid = np.linspace(0.6, 2.5, 26)
+        best_T, best_loss = 1.0, np.inf
+        for T in grid:
+            p_cal = self._softmax(np.log(proba) / T)
+            ll = log_loss(y_true, p_cal, labels=np.arange(proba.shape[1]))
+            if ll < best_loss:
+                best_loss, best_T = ll, T
+        fine = np.linspace(max(0.2, best_T - 0.5), best_T + 0.5, 31)
+        for T in fine:
+            p_cal = self._softmax(np.log(proba) / T)
+            ll = log_loss(y_true, p_cal, labels=np.arange(proba.shape[1]))
+            if ll < best_loss:
+                best_loss, best_T = ll, T
+        self.T = float(best_T); return self
+    def transform(self, proba: np.ndarray) -> np.ndarray:
+        proba = np.clip(proba, self.eps, 1 - self.eps)
+        return self._softmax(np.log(proba) / self.T)
+    @staticmethod
+    def _softmax(logits: np.ndarray) -> np.ndarray:
+        z = logits - logits.max(axis=1, keepdims=True)
+        e = np.exp(z)
+        return e / e.sum(axis=1, keepdims=True)
+
+@dataclass
+class BinaryTempScaler:
+    T: float = 1.0
+    eps: float = 1e-12
+    def fit(self, p: np.ndarray, y_true: np.ndarray):
+        p = np.clip(p, self.eps, 1 - self.eps)
+        z = np.log(p/(1-p))
+        grid = np.linspace(0.6, 2.5, 26)
+        best_T, best_loss = 1.0, np.inf
+        for T in grid:
+            p_cal = 1.0 / (1.0 + np.exp(-z / T))
+            ll = log_loss(y_true, np.column_stack([1-p_cal, p_cal]), labels=[0,1])
+            if ll < best_loss: best_loss, best_T = ll, T
+        fine = np.linspace(max(0.2, best_T - 0.5), best_T + 0.5, 31)
+        for T in fine:
+            p_cal = 1.0 / (1.0 + np.exp(-z / T))
+            ll = log_loss(y_true, np.column_stack([1-p_cal, p_cal]), labels=[0,1])
+            if ll < best_loss: best_loss, best_T = ll, T
+        self.T = float(best_T); return self
+    def transform(self, p: np.ndarray) -> np.ndarray:
+        p = np.clip(p, self.eps, 1 - self.eps)
+        z = np.log(p/(1-p))
+        return 1.0 / (1.0 + np.exp(-z / self.T))
+
+# ================== مُولّد الميزات ==================
+class FeatureBuilder:
+    def __init__(self, comp_alpha: float = 30.0):
+        self.comp_alpha = comp_alpha
+        self.global_prior_: Optional[np.ndarray] = None
+        self.comp_priors_: Dict[str, np.ndarray] = {}
+        self.features_: List[str] = []
+    def fit(self, df: pd.DataFrame, y: pd.Series):
+        assert 'competition' in df.columns, "عمود competition مفقود"
+        counts = y.value_counts().reindex([0, 1, 2], fill_value=0).values.astype(float)
+        self.global_prior_ = counts / counts.sum()
+        tmp = df[['competition']].copy(); tmp['target'] = y.values
+        for comp, g in tmp.groupby('competition'):
+            c = g['target'].value_counts().reindex([0,1,2], fill_value=0).values.astype(float)
+            total = c.sum()
+            smooth = (c + self.comp_alpha * self.global_prior_) / (total + self.comp_alpha)
+            self.comp_priors_[comp] = smooth
+        return self
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        X = pd.DataFrame(index=df.index)
+        elo_home = pd.to_numeric(df['home_team_elo'], errors='coerce').astype(float)
+        elo_away = pd.to_numeric(df['away_team_elo'], errors='coerce').astype(float)
+        elo_diff = elo_home - elo_away
+        X['elo_diff'] = elo_diff
+        X['elo_sum'] = elo_home + elo_away
+        X['elo_ratio'] = (elo_home + 1.0) / (elo_away + 1.0)
+        X['elo_prob_home'] = 1.0 / (1.0 + 10 ** (-(elo_diff) / 400.0))
+        X['abs_elo_diff'] = np.abs(elo_diff)
+        h_pts = pd.to_numeric(df['home_form_points'], errors='coerce').astype(float)
+        a_pts = pd.to_numeric(df['away_form_points'], errors='coerce').astype(float)
+        h_gs = pd.to_numeric(df['home_form_gs'], errors='coerce').astype(float)
+        h_gc = pd.to_numeric(df['home_form_gc'], errors='coerce').astype(float)
+        a_gs = pd.to_numeric(df['away_form_gs'], errors='coerce').astype(float)
+        a_gc = pd.to_numeric(df['away_form_gc'], errors='coerce').astype(float)
+        X['form_points_diff'] = h_pts - a_pts
+        X['abs_form_points_diff'] = np.abs(X['form_points_diff'])
+        X['form_gd_home'] = h_gs - h_gc
+        X['form_gd_away'] = a_gs - a_gc
+        X['form_gd_diff'] = X['form_gd_home'] - X['form_gd_away']
+        X['abs_form_gd_diff'] = np.abs(X['form_gd_diff'])
+        X['total_form_gs'] = h_gs + a_gs
+        X['total_form_gc'] = h_gc + a_gc
+        X['closeness_elo'] = np.exp(-X['abs_elo_diff'] / 200.0)
+        X['closeness_points'] = np.exp(-X['abs_form_points_diff'] / 6.0)
+        X['closeness_gd'] = np.exp(-X['abs_form_gd_diff'] / 4.0)
+        X['low_total_proxy'] = np.exp(-(X['total_form_gs'] + X['total_form_gc']) / 12.0)
+        # League
+        if 'home_team_league_pos' in df.columns and 'away_team_league_pos' in df.columns:
+            h_pos = pd.to_numeric(df['home_team_league_pos'], errors='coerce')
+            a_pos = pd.to_numeric(df['away_team_league_pos'], errors='coerce')
+            X['league_pos_diff'] = (a_pos - h_pos).fillna(0.0)
+        else:
+            X['league_pos_diff'] = 0.0
+        X['pos_diff_abs'] = np.abs(X['league_pos_diff'])
+        # Time
+        dates = pd.to_datetime(df['date'], errors='coerce')
+        X['is_weekend'] = dates.dt.weekday.isin([5,6]).astype(int)
+        X['month_sin'] = np.sin(2*np.pi*(dates.dt.month.fillna(1)/12))
+        X['month_cos'] = np.cos(2*np.pi*(dates.dt.month.fillna(1)/12))
+        # Competition priors
+        comp = df['competition'].astype(str)
+        comp_home, comp_draw, comp_away = [], [], []
+        for c in comp:
+            p = self.comp_priors_.get(c, self.global_prior_)
+            comp_home.append(p[0]); comp_draw.append(p[1]); comp_away.append(p[2])
+        X['comp_home_prior'] = comp_home
+        X['comp_draw_prior'] = comp_draw
+        X['comp_away_prior'] = comp_away
+        # Features داعمة للتعادل
+        X['tight_score'] = 0.5*X['closeness_elo'] + 0.25*X['closeness_points'] + 0.25*X['closeness_gd']
+        X['tight_flag'] = ((X['abs_elo_diff'] <= 60) &
+                           (X['abs_form_points_diff'] <= 3) &
+                           (X['abs_form_gd_diff'] <= 2) &
+                           (X['pos_diff_abs'] <= 4)).astype(int)
+        self.features_ = list(X.columns)
+        return X.fillna(0.0)
+    def get_feature_names_out(self):
+        return self.features_
+
+# Priors على مستوى الفريق
+class TeamPriors:
+    def __init__(self, alpha: float = 50.0):
+        self.alpha = alpha
+        self.global_draw_rate = 0.3
+        self.global_home_gf = 1.4
+        self.global_home_ga = 1.1
+        self.global_away_gf = 1.1
+        self.global_away_ga = 1.4
+        self.team_stats_: Dict[str, dict] = {}
+    def fit(self, df_train: pd.DataFrame):
+        df = df_train.copy()
+        self.global_draw_rate = (df['target'] == 1).mean()
+        self.global_home_gf = df['result_ft_home_goals'].mean()
+        self.global_home_ga = df['result_ft_away_goals'].mean()
+        self.global_away_gf = df['result_ft_away_goals'].mean()
+        self.global_away_ga = df['result_ft_home_goals'].mean()
+        home_grp = df.groupby('home_team_id').agg(
+            home_n=('home_team_id', 'size'),
+            home_draws=('target', lambda s: (s == 1).sum()),
+            home_gf=('result_ft_home_goals', 'sum'),
+            home_ga=('result_ft_away_goals', 'sum')
+        )
+        away_grp = df.groupby('away_team_id').agg(
+            away_n=('away_team_id', 'size'),
+            away_draws=('target', lambda s: (s == 1).sum()),
+            away_gf=('result_ft_away_goals', 'sum'),
+            away_ga=('result_ft_home_goals', 'sum')
+        )
+        teams = set(home_grp.index.astype(str)).union(set(away_grp.index.astype(str)))
+        self.team_stats_ = {}
+        for t in teams:
+            hs = home_grp.loc[t] if t in home_grp.index else None
+            as_ = away_grp.loc[t] if t in away_grp.index else None
+            home_n = int(hs['home_n']) if hs is not None else 0
+            away_n = int(as_['away_n']) if as_ is not None else 0
+            home_draws = int(hs['home_draws']) if hs is not None else 0
+            away_draws = int(as_['away_draws']) if as_ is not None else 0
+            home_gf = float(hs['home_gf']) if hs is not None else 0.0
+            home_ga = float(hs['home_ga']) if hs is not None else 0.0
+            away_gf = float(as_['away_gf']) if as_ is not None else 0.0
+            away_ga = float(as_['away_ga']) if as_ is not None else 0.0
+            a = self.alpha
+            p_home_draw = (home_draws + a*self.global_draw_rate) / (home_n + a) if (home_n + a)>0 else self.global_draw_rate
+            p_away_draw = (away_draws + a*self.global_draw_rate) / (away_n + a) if (away_n + a)>0 else self.global_draw_rate
+            p_overall = (home_draws + away_draws + a*self.global_draw_rate) / (home_n + away_n + a) if (home_n + away_n + a)>0 else self.global_draw_rate
+            home_gf_avg = (home_gf + a*self.global_home_gf) / (home_n + a) if (home_n + a)>0 else self.global_home_gf
+            home_ga_avg = (home_ga + a*self.global_home_ga) / (home_n + a) if (home_n + a)>0 else self.global_home_ga
+            away_gf_avg = (away_gf + a*self.global_away_gf) / (away_n + a) if (away_n + a)>0 else self.global_away_gf
+            away_ga_avg = (away_ga + a*self.global_away_ga) / (away_n + a) if (away_n + a)>0 else self.global_away_ga
+            self.team_stats_[str(t)] = {
+                'home_draw_rate': p_home_draw,
+                'away_draw_rate': p_away_draw,
+                'overall_draw_rate': p_overall,
+                'home_gf_avg': home_gf_avg, 'home_ga_avg': home_ga_avg,
+                'away_gf_avg': away_gf_avg, 'away_ga_avg': away_ga_avg,
+            }
+        return self
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        X = pd.DataFrame(index=df.index)
+        home_ids = df['home_team_id'].astype(str)
+        away_ids = df['away_team_id'].astype(str)
+        def get_stat(team_id: str, key: str, default: float):
+            return self.team_stats_.get(team_id, {}).get(key, default)
+        X['home_team_home_gf_avg'] = [get_stat(t, 'home_gf_avg', self.global_home_gf) for t in home_ids]
+        X['home_team_home_ga_avg'] = [get_stat(t, 'home_ga_avg', self.global_home_ga) for t in home_ids]
+        X['away_team_away_gf_avg'] = [get_stat(t, 'away_gf_avg', self.global_away_gf) for t in away_ids]
+        X['away_team_away_ga_avg'] = [get_stat(t, 'away_ga_avg', self.global_away_ga) for t in away_ids]
+        X['home_team_draw_rate_overall'] = [get_stat(t, 'overall_draw_rate', 0.3) for t in home_ids]
+        X['away_team_draw_rate_overall'] = [get_stat(t, 'overall_draw_rate', 0.3) for t in away_ids]
+        X['draw_rate_diff'] = [get_stat(h, 'home_draw_rate', 0.3) - get_stat(a, 'away_draw_rate', 0.3) for h,a in zip(home_ids, away_ids)]
+        return X.fillna(0.0)
+
+# ================== أدوات ==================
+def compute_closeness_score(X: pd.DataFrame) -> np.ndarray:
+    return (0.5 * X['closeness_elo'].values
+            + 0.25 * X['closeness_points'].values
+            + 0.25 * X['closeness_gd'].values)
+
+def build_sample_weights_selective(y: pd.Series, X: pd.DataFrame,
+                                   draw_weight: float, k: float, clip_max: float = 3.0) -> np.ndarray:
+    classes = np.array([0, 1, 2])
+    class_weights = compute_class_weight(class_weight='balanced', classes=classes, y=y)
+    cw_map = {c: w for c, w in zip(classes, class_weights)}
+    sw = y.map(cw_map).astype(float).values
+    if draw_weight != 1.0 or k != 0.0:
+        s = compute_closeness_score(X)
+        mult = np.clip(1.0 + k * s, 1.0, clip_max)
+        sw[y.values == 1] *= (draw_weight * mult[y.values == 1])
+    return sw
+
+def sample_params_binary(rng):
+    return {
+        'learning_rate': float(rng.uniform(0.03, 0.12)),
+        'max_depth': int(rng.integers(3, 7)),
+        'min_child_weight': float(rng.choice([1.0, 2.0, 3.0, 5.0])),
+        'subsample': float(rng.uniform(0.7, 1.0)),
+        'colsample_bytree': float(rng.uniform(0.6, 1.0)),
+        'gamma': float(rng.choice([0.0, 0.1, 0.2, 0.4])),
+        'reg_alpha': float(rng.choice([0.0, 0.1, 1.0, 5.0])),
+        'reg_lambda': float(rng.choice([0.5, 1.0, 2.0, 5.0])),
+        'n_estimators': N_ESTIMATORS_RS,
+        'random_state': RANDOM_STATE
+    }
+
+def combine_probs(p_draw: np.ndarray, p_home_given_no_draw: np.ndarray) -> np.ndarray:
+    p_home = (1.0 - p_draw) * p_home_given_no_draw
+    p_away = (1.0 - p_draw) * (1.0 - p_home_given_no_draw)
+    P = np.vstack([p_home, p_draw, p_away]).T
+    P = np.clip(P, 1e-12, 1.0)
+    return P / P.sum(axis=1, keepdims=True)
+
+def tune_tau_gamma(p_draw_val: np.ndarray, p_home_cond_val: np.ndarray,
+                   X_val: pd.DataFrame, y_val: pd.Series, acc_floor: float,
+                   tau_grid=TAU_GRID, gamma_grid=GAMMA_GRID) -> Dict:
+    best = None
+    for tau in tau_grid:
+        for gamma in gamma_grid:
+            draw_mask = (p_draw_val >= tau) & (compute_closeness_score(X_val) >= gamma)
+            y_pred = np.where(draw_mask, 1, np.where(p_home_cond_val >= 0.5, 0, 2))
+            acc = accuracy_score(y_val, y_pred)
+            f1m = f1_score(y_val, y_pred, average='macro')
+            bal = balanced_accuracy_score(y_val, y_pred)
+            if acc >= acc_floor:
+                if (best is None) or (f1m > best['f1m']) or (abs(f1m - best['f1m']) < 1e-6 and acc > best['acc']):
+                    best = {'tau': float(tau), 'gamma': float(gamma), 'acc': acc, 'bal_acc': bal, 'f1m': f1m}
+    if best is None:
+        # fallback: نحسن F1 ماكرو حتى لو أقل من acc_floor
+        for tau in tau_grid:
+            for gamma in gamma_grid:
+                draw_mask = (p_draw_val >= tau) & (compute_closeness_score(X_val) >= gamma)
+                y_pred = np.where(draw_mask, 1, np.where(p_home_cond_val >= 0.5, 0, 2))
+                acc = accuracy_score(y_val, y_pred)
+                f1m = f1_score(y_val, y_pred, average='macro')
+                bal = balanced_accuracy_score(y_val, y_pred)
+                if (best is None) or (f1m > best['f1m']) or (abs(f1m - best['f1m']) < 1e-6 and acc > best['acc']):
+                    best = {'tau': float(tau), 'gamma': float(gamma), 'acc': acc, 'bal_acc': bal, 'f1m': f1m}
+    return best
+
+# ================== التدريب الرئيسي ==================
+def train():
+    print("Loading dataset...")
+    df = pd.read_csv(INPUT_CSV_FILE)
+
+    required_cols = [
+        'date','competition',
+        'home_team_id','away_team_id',
+        'home_team_elo','away_team_elo',
+        'home_form_points','home_form_gs','home_form_gc',
+        'away_form_points','away_form_gs','away_form_gc',
+        'result_ft_home_goals','result_ft_away_goals'
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing: raise ValueError(f"Missing required columns: {missing}")
+
+    df = df.dropna(subset=required_cols).copy()
+    df = df[(df['home_form_points'] > 0) | (df['away_form_points'] > 0)]
+    if 'match_id' in df.columns: df = df.drop_duplicates(subset='match_id')
+    if df.empty:
+        print("Dataset is empty after cleaning. Cannot train model."); return
+
+    # الهدف: 0 Home, 1 Draw, 2 Away
+    df['target'] = np.select(
+        [
+            df['result_ft_home_goals'] > df['result_ft_away_goals'],
+            df['result_ft_home_goals'] == df['result_ft_away_goals'],
+        ], [0, 1], default=2
+    ).astype(int)
+
+    # تقسيم زمني
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df.dropna(subset=['date']).sort_values('date').reset_index(drop=True)
+    df_train, df_val, df_test = time_split_by_day(df, train_frac=0.70, val_frac=0.15)
+
+    y_train = df_train['target']; y_val = df_val['target']; y_test = df_test['target']
+    print(f"Train: {len(df_train)} | Val: {len(df_val)} | Test: {len(df_test)}")
+    print(f"Train last date: {df_train['date'].max().date()} | "
+          f"Val last date: {df_val['date'].max().date()} | "
+          f"Test start date: {df_test['date'].min().date()}")
+
+    # ميزات
+    fb = FeatureBuilder(comp_alpha=30.0).fit(df_train, y_train)
+    tp = TeamPriors(alpha=50.0).fit(df_train)
+    def build_X(df_block):
+        return pd.concat([fb.transform(df_block), tp.transform(df_block)], axis=1)
+    X_train = build_X(df_train); X_val = build_X(df_val); X_test = build_X(df_test)
+
+    # ============ المرحلة 1: Draw vs Not-Draw ============
+    best_stage1 = None; best_stage1_ll = np.inf
+    best_s1_cfg = None; s1_T = None
+    rng1 = np.random.default_rng(RANDOM_STATE)
+    for dw in DRAW_WEIGHT_GRID:
+        for k in K_SELECTIVE_GRID:
+            sw_train_s1 = build_sample_weights_selective(y_train, X_train, draw_weight=dw, k=k)
+            for i in range(N_TRIALS_STAGE1):
+                params = sample_params_binary(rng1)
+                model = xgb.XGBClassifier(
+                    objective='binary:logistic', eval_metric='logloss',
+                    tree_method='hist', n_jobs=-1, **params
+                )
+                xgb_fit_with_es(model, X_train, (y_train==1).astype(int), sw_train_s1, X_val, (y_val==1).astype(int), es_rounds=150)
+                p_val = model.predict_proba(X_val)[:,1]
+                calib = BinaryTempScaler().fit(p_val, (y_val==1).astype(int))
+                p_val_cal = calib.transform(p_val)
+                ll = log_loss((y_val==1).astype(int), np.column_stack([1-p_val_cal, p_val_cal]), labels=[0,1])
+                if ll < best_stage1_ll:
+                    best_stage1_ll = ll; best_stage1 = model; best_s1_cfg = {'dw':dw, 'k':k, **params}; s1_T = calib.T
+    print(f"[Stage1] Best logloss: {best_stage1_ll:.4f} | params: {best_s1_cfg} | T={s1_T:.3f}")
+
+    # ============ المرحلة 2: Home vs Away (non-draw فقط) ============
+    mask_tr = (y_train != 1); mask_val = (y_val != 1)
+    y_train_ha = (y_train[mask_tr] == 0).astype(int)
+    y_val_ha = (y_val[mask_val] == 0).astype(int)
+    X_train_ha = X_train[mask_tr]; X_val_ha = X_val[mask_val]
+
+    cw_ha = compute_class_weight(class_weight='balanced', classes=np.array([0,1]), y=y_train_ha)
+    sw_train_ha = np.where(y_train_ha.values == 1, cw_ha[1], cw_ha[0])
+
+    best_stage2 = None; best_stage2_ll = np.inf
+    best_s2_cfg = None; s2_T = None
+    rng2 = np.random.default_rng(RANDOM_STATE + 1000)
+    for i in range(N_TRIALS_STAGE2):
+        params = sample_params_binary(rng2)
+        model = xgb.XGBClassifier(
+            objective='binary:logistic', eval_metric='logloss',
+            tree_method='hist', n_jobs=-1, **params
+        )
+        xgb_fit_with_es(model, X_train_ha, y_train_ha, sw_train_ha, X_val_ha, y_val_ha, es_rounds=150)
+        p_val = model.predict_proba(X_val_ha)[:,1]
+        calib = BinaryTempScaler().fit(p_val, y_val_ha)
+        p_val_cal = calib.transform(p_val)
+        ll = log_loss(y_val_ha, np.column_stack([1-p_val_cal, p_val_cal]), labels=[0,1])
+        if ll < best_stage2_ll:
+            best_stage2_ll = ll; best_stage2 = model; best_s2_cfg = params; s2_T = calib.T
+    print(f"[Stage2] Best logloss: {best_stage2_ll:.4f} | params: {best_s2_cfg} | T={s2_T:.3f}")
+
+    # ============ توليف على Val واختيار العتبات τ, γ ============
+    p_draw_val = best_stage1.predict_proba(X_val)[:,1]
+    p_draw_val = BinaryTempScaler(T=s1_T).transform(p_draw_val)
+
+    p_home_val_cond = np.zeros(len(X_val))
+    p_home_val_cond[mask_val] = BinaryTempScaler(T=s2_T).transform(best_stage2.predict_proba(X_val_ha)[:,1])
+    # للعينات draw في Val (mask_val=False) سنستخدم p_home_cond 0.5 كافتراض
+    p_home_val_cond[~mask_val] = 0.5
+
+    # baseline acc باستخدام argmax دون بوابة
+    P_val_comb = combine_probs(p_draw_val, p_home_val_cond)
+    acc_base = accuracy_score(y_val, P_val_comb.argmax(axis=1))
+    acc_floor = acc_base - ACC_DROP_ALLOWED
+
+    gating = tune_tau_gamma(p_draw_val, p_home_val_cond, X_val, y_val, acc_floor)
+    print(f"Val base Acc (argmax): {acc_base:.2%} | acc_floor: {acc_floor:.2%}")
+    print(f"Tuned gating -> tau={gating['tau']:.3f}, gamma={gating['gamma']:.2f}, "
+          f"Acc={gating['acc']:.2%}, Macro-F1={gating['f1m']:.2%}")
+
+    # ============ تقييم على الاختبار ============
+    p_draw_te = best_stage1.predict_proba(X_test)[:,1]
+    p_draw_te = BinaryTempScaler(T=s1_T).transform(p_draw_te)
+
+    mask_te = (y_test != 1)
+    X_test_ha = X_test[mask_te]
+    p_home_te_cond = np.zeros(len(X_test))
+    if len(X_test_ha) > 0:
+        p_home_te_cond[mask_te] = BinaryTempScaler(T=s2_T).transform(best_stage2.predict_proba(X_test_ha)[:,1])
+    p_home_te_cond[~mask_te] = 0.5
+
+    # تصنيف بالبوابة
+    draw_mask_te = (p_draw_te >= gating['tau']) & (compute_closeness_score(X_test) >= gating['gamma'])
+    y_pred_test = np.where(draw_mask_te, 1, np.where(p_home_te_cond >= 0.5, 0, 2))
+
+    acc, bal_acc, f1m = accuracy_score(y_test, y_pred_test), balanced_accuracy_score(y_test, y_pred_test), f1_score(y_test, y_pred_test, average='macro')
+    print(f"\nTest (Two-Stage + gating) -> Acc: {acc:.2%} | BalAcc: {bal_acc:.2%} | Macro-F1: {f1m:.2%}")
+    print("\nClassification Report (Test):")
+    print(classification_report(y_test, y_pred_test, target_names=['Home Win','Draw','Away Win'], zero_division=0))
+    print("Confusion Matrix (rows=true, cols=pred):")
+    print(confusion_matrix(y_test, y_pred_test, labels=[0,1,2]))
+
+    # حفظ
+    artifact = {
+        'stage1_draw_model': best_stage1,
+        'stage1_temp_T': float(s1_T),
+        'stage1_config': best_s1_cfg,
+        'stage2_ha_model': best_stage2,
+        'stage2_temp_T': float(s2_T),
+        'stage2_config': best_s2_cfg,
+        'feature_builder': fb,
+        'team_priors': tp,
+        'decision': {'tau_draw': float(gating['tau']), 'gamma_close': float(gating['gamma'])},
+        'label_map': {0:'Home Win', 1:'Draw', 2:'Away Win'},
+        'meta': {
+            'xgboost_version': xgb.__version__,
+            'train_rows': int(len(df_train)),
+            'val_rows': int(len(df_val)),
+            'test_rows': int(len(df_test)),
+            'train_last_date': str(df_train['date'].max().date()),
+            'test_start_date': str(df_test['date'].min().date()),
+            'acc_floor': float(acc_floor),
+            'es_mode': ES_MODE,
+            'best_iter_stage1': get_best_iteration(best_stage1),
+            'best_iter_stage2': get_best_iteration(best_stage2),
+        }
+    }
+    print(f"\nSaving trained model to '{MODEL_OUTPUT_FILE}'...")
+    joblib.dump(artifact, MODEL_OUTPUT_FILE)
+    print("✅ Model saved successfully.")
+
+# ================== استدلال ==================
+def predict_match(example: dict, model_path: str = MODEL_OUTPUT_FILE, return_pred: bool = True) -> Dict[str, float]:
+    art = joblib.load(model_path)
+    m1 = art['stage1_draw_model']; T1 = art['stage1_temp_T']
+    m2 = art['stage2_ha_model'];  T2 = art['stage2_temp_T']
+    fb = art['feature_builder']; tp = art['team_priors']
+    tau = art['decision']['tau_draw']; gamma = art['decision']['gamma_close']
+    label_map = art['label_map']
+
+    df = pd.DataFrame([example])
+    for opt in ['home_team_league_pos','away_team_league_pos']:
+        if opt not in df.columns: df[opt] = np.nan
+
+    X = pd.concat([fb.transform(df), tp.transform(df)], axis=1)
+
+    p_draw = m1.predict_proba(X)[:,1]
+    p_draw = BinaryTempScaler(T=T1).transform(p_draw)
+
+    p_home_cond = BinaryTempScaler(T=T2).transform(m2.predict_proba(X)[:,1])
+
+    # احتمالات مجمعة
+    P = combine_probs(p_draw, p_home_cond)
+
+    # قرار نهائي بالبوابة
+    draw_mask = (p_draw >= tau) & (compute_closeness_score(X) >= gamma)
+    y_pred = int(np.where(draw_mask, 1, np.where(p_home_cond >= 0.5, 0, 2))[0])
+
+    out = {label_map[i]: float(P[0, i]) for i in range(3)}
+    if return_pred:
+        out['pred'] = label_map[y_pred]
+    return out
+
+if __name__ == "__main__":
+    train()
