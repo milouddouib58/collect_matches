@@ -150,7 +150,7 @@ def collect_league(league_code: str, start_season: int, end_season: int, out_csv
 def parse_args():
     parser = argparse.ArgumentParser(description="مجمع نتائج مباريات الدوري وحفظها في CSV.")
     parser.add_argument("--league", type=str, default=DEFAULT_LEAGUE)
-    parser.add_argument("--start-season", type=int, default=2023)
+    parser.add_argument("--start-season", type=int, default=2025)
     parser.add_argument("--end-season", type=int, default=2025)
     parser.add_argument("--output", type=str, default="matches_data.csv")
     parser.add_argument("--current-only", action="store_true")
@@ -159,3 +159,4 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     collect_league(args.league, args.start_season, args.end_season, args.output, args.current_only)
+
