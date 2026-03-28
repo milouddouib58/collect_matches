@@ -26,20 +26,8 @@ def ensure_sklearn_unpickle_shims():
     except Exception:
         pass
 
-def load_model_any(path: str):
-    if SKOPS_AVAILABLE and path.lower().endswith(".skops"):
-        return skops_load(path, trusted=True)
-    ensure_sklearn_unpickle_shims()
-    return joblib.load(path)
-
 def map_proba_to_HDA(classes_model, proba):
-    """
-    يحوّل أي تمثيل للفئات إلى خريطة H/D/A -> probability
-    يدعم:
-      - نصوص H/D/A مباشرة
-      - نصوص مرادفات: Home/Home Win/1, Draw/X, Away/Away Win/2
-      - أرقام {0,1,2} كما ينتج LabelEncoder بترتيب أبجدي (A=0, D=1, H=2)
-    """
+    """نسخة محسّنة مع fallback آمن."""
     labels = list(classes_model)
     out = {}
 
@@ -54,38 +42,37 @@ def map_proba_to_HDA(classes_model, proba):
                 norm_map["D"] = float(p)
             elif s in ("a", "away", "away win", "2"):
                 norm_map["A"] = float(p)
-            else:
-                # إذا كانت قيم غريبة، تجاهلها
-                pass
-        # إذا كانت بالضبط H/D/A كنصوص كبيرة/صغيرة
-        if not norm_map and set([c.upper() for c in labels]) >= {"H", "D", "A"}:
-            for cls, p in zip(labels, proba):
-                norm_map[cls.upper()] = float(p)
-        return {
-            "H": norm_map.get("H", 0.0),
-            "D": norm_map.get("D", 0.0),
-            "A": norm_map.get("A", 0.0),
-        }
+        if norm_map:
+            return {
+                "H": norm_map.get("H", 0.0),
+                "D": norm_map.get("D", 0.0),
+                "A": norm_map.get("A", 0.0),
+            }
 
-    # حالة أرقام {0,1,2} (LabelEncoder أبجدي: A=0, D=1, H=2)
+    # حالة أرقام {0,1,2}
     try:
         label_set = set(int(x) for x in labels)
         if label_set == {0, 1, 2}:
-            idx_A = labels.index(0)
-            idx_D = labels.index(1)
-            idx_H = labels.index(2)
+            idx_map = {int(l): i for i, l in enumerate(labels)}
             return {
-                "H": float(proba[idx_H]),
-                "D": float(proba[idx_D]),
-                "A": float(proba[idx_A]),
+                "H": float(proba[idx_map[2]]),  # H=2
+                "D": float(proba[idx_map[1]]),  # D=1
+                "A": float(proba[idx_map[0]]),  # A=0
             }
     except Exception:
         pass
 
-    # fallback: خصّص أعلى احتمال للنتيجة الأقرب اسمًا (قلّما نصل هنا)
-    # لكن لتجنّب 0.0 للجميع نطبّق softmax للتجزئة (احتمالات proba جاهزة أصلاً، لذا نعيدها كما هي بأي ترتيب)
-    # سنعيد 0.0 لأننا لا نعرف الترتيب، لكن نحتفظ بالأمان:
-    return {"H": 0.0, "D": 0.0, "A": 0.0}
+    # ✅ إصلاح: Fallback ذكي بدل أصفار
+    # إذا 3 فئات → وزعها بالترتيب H/D/A
+    if len(proba) == 3:
+        return {
+            "H": float(proba[2]),
+            "D": float(proba[1]),
+            "A": float(proba[0]),
+        }
+
+    # آخر ملجأ: توزيع متساوي
+    return {"H": 1/3, "D": 1/3, "A": 1/3}
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Predict match outcome H/D/A probabilities.")
